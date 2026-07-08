@@ -1,4 +1,9 @@
 /target
 .vscode
-.superpatch
 .idea
+configs
+archives
+mods
+patch
+instance
+.vfs

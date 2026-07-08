@@ -54,3 +54,16 @@ Problems
             - Confirm remove.
     - Images
     - Direct patch from existing file
+
+## Safety & Folders
+
+If you copy over your whole instance to ANYWHERE else, it should work EXACTLY the same.
+Required:
+    configs - The order data, patch data, and settings.
+    patch - The patch files.
+    mods - Contains mod folders. Technically you can have mods other places but it's not cool.
+Optional:
+    archives - The original archive for the mod. Not nessacary but makes reinstallation easier.
+    instance - You could have your instance anywhere. But it should probably be here.
+Not recommended:
+    VFS - The current VFS-modified instance. Symlinks will *probably* break if their origins are transferred, so let the software just generate a new one. (Also not cross-platform)
