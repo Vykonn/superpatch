@@ -1,14 +1,15 @@
+use std::collections::{BTreeMap, HashMap};
 use eframe::{egui::{self}};
 use serde_json::{Value};
 use std::fs;
-use serde_json::Map;
 use std::path::Path;
 use egui_extras::{TableBuilder, Column};
 
 struct SuperPatchApp {
     selected_tab: Tab, 
     orderdata: Value, 
-    vfsdata: Value, 
+    vfsdata: VFSTree,
+    vfscache: HashMap<String, VFSNode>,
     organizesort: OrganizeSort, 
     organizesort_list: Vec<OrganizeSortListEntry>,
     organizesort_edit: OrganizeSortEdit, 
@@ -80,10 +81,20 @@ enum VFSSortType {
     ShowConflicts,
     ShowDLTXPatches
 }
-
+type VFSTree = BTreeMap<String, VFSNode>;
+#[derive(Clone)]
+enum VFSNode {
+    Dir(VFSTree),
+    File(VFSFile)
+}
+#[derive(Clone)]
+struct VFSFile {
+    paths: HashMap<String, String>,
+    dltx_patches: HashMap<String, String>
+}
 impl SuperPatchApp {
-    fn new(_cc: &eframe::CreationContext<'_>, orderdata: Value, vfsdata: Value, organizesort_list: Vec<OrganizeSortListEntry>, settings: Value, vfssort_list: Vec<VFSSortListEntry>, patchdata: Value) -> Self { 
-        Self {selected_tab: Tab::Organize, orderdata, vfsdata, organizesort: OrganizeSort::PriorityAsc, organizesort_list, organizesort_edit: OrganizeSortEdit { edit_type: OrganizeSortEditType::None, index: 0, value: String::new() }, status: "Ready.".to_string(), settings, vfssort: VFSSort { sort_type: VFSSortType::ShowAll, expanded: Vec::new(), query: String::new() }, vfssort_list, vfssort_list_refresh_requested: false, patchdata}
+    fn new(_cc: &eframe::CreationContext<'_>, orderdata: Value, vfsdata: VFSTree, vfscache: HashMap<String, VFSNode>, organizesort_list: Vec<OrganizeSortListEntry>, settings: Value, vfssort_list: Vec<VFSSortListEntry>, patchdata: Value) -> Self {
+        Self {selected_tab: Tab::Organize, orderdata, vfsdata, vfscache, organizesort: OrganizeSort::PriorityAsc, organizesort_list, organizesort_edit: OrganizeSortEdit { edit_type: OrganizeSortEditType::None, index: 0, value: String::new() }, status: "Ready.".to_string(), settings, vfssort: VFSSort { sort_type: VFSSortType::ShowAll, expanded: Vec::new(), query: String::new() }, vfssort_list, vfssort_list_refresh_requested: false, patchdata}
     }
 }
 
@@ -121,7 +132,7 @@ impl eframe::App for SuperPatchApp {
                         //install_mod(file_path);
                     }
                     if ui.button("Refresh").clicked() {
-                        (self.orderdata, self.vfsdata, self.organizesort_list, self.vfssort_list) = refresh_data(self.organizesort.clone(), self.vfssort.clone(), self.patchdata.clone());
+                        (self.orderdata, self.vfsdata, self.vfscache, self.organizesort_list, self.vfssort_list) = refresh_data(self.organizesort.clone(), self.vfssort.clone(), self.patchdata.clone());
                         
                     }
                     if ui.button("Quit").clicked() {
@@ -261,7 +272,7 @@ impl eframe::App for SuperPatchApp {
                             row.col(|ui| {
                                 ui.checkbox(&mut enabled, "").changed().then(|| {
                                     self.orderdata[row_index]["enabled"] = Value::Bool(enabled);
-                                    (self.vfsdata, self.organizesort_list, self.vfssort_list) = update_data(self.orderdata.clone(), self.organizesort.clone(), self.vfssort.clone(), self.patchdata.clone());
+                                    (self.vfsdata, self.vfscache, self.organizesort_list, self.vfssort_list) = update_data(self.orderdata.clone(), self.organizesort.clone(), self.vfssort.clone(), self.patchdata.clone(), self.vfscache.clone());
                                     self.status = if enabled { "Enabled mod.".to_string() } else { "Disabled mod.".to_string() };
                                 });
                             });
@@ -270,7 +281,7 @@ impl eframe::App for SuperPatchApp {
                                     let response = ui.add(egui::TextEdit::singleline(&mut self.organizesort_edit.value));
                                     if response.lost_focus() {
                                         self.orderdata[priority as usize]["name"] = Value::String(self.organizesort_edit.value.clone());
-                                        (self.vfsdata, self.organizesort_list, self.vfssort_list) = update_data(self.orderdata.clone(), self.organizesort.clone(), self.vfssort.clone(), self.patchdata.clone());
+                                        (self.vfsdata, self.vfscache, self.organizesort_list, self.vfssort_list) = update_data(self.orderdata.clone(), self.organizesort.clone(), self.vfssort.clone(), self.patchdata.clone(), self.vfscache.clone());
                                         self.organizesort_edit.edit_type = OrganizeSortEditType::None;
                                         self.organizesort_edit.index = 0;
                                     }
@@ -291,7 +302,7 @@ impl eframe::App for SuperPatchApp {
                                     let response = ui.add(egui::TextEdit::singleline(&mut self.organizesort_edit.value));
                                     if response.lost_focus() {
                                         self.orderdata[priority as usize]["category"] = Value::String(self.organizesort_edit.value.clone());
-                                        (self.vfsdata, self.organizesort_list, self.vfssort_list) = update_data(self.orderdata.clone(), self.organizesort.clone(), self.vfssort.clone(), self.patchdata.clone());
+                                        (self.vfsdata, self.vfscache, self.organizesort_list, self.vfssort_list) = update_data(self.orderdata.clone(), self.organizesort.clone(), self.vfssort.clone(), self.patchdata.clone(), self.vfscache.clone());
                                         self.organizesort_edit.edit_type = OrganizeSortEditType::None;
                                         self.organizesort_edit.index = 0;
                                     }
@@ -311,7 +322,7 @@ impl eframe::App for SuperPatchApp {
                                     let response = ui.add(egui::TextEdit::singleline(&mut self.organizesort_edit.value));
                                     if response.lost_focus() {
                                         self.orderdata[priority as usize]["version"] = Value::String(self.organizesort_edit.value.clone());
-                                        (self.vfsdata, self.organizesort_list, self.vfssort_list) = update_data(self.orderdata.clone(), self.organizesort.clone(), self.vfssort.clone(), self.patchdata.clone());
+                                        (self.vfsdata, self.vfscache, self.organizesort_list, self.vfssort_list) = update_data(self.orderdata.clone(), self.organizesort.clone(), self.vfssort.clone(), self.patchdata.clone(), self.vfscache.clone());
                                         self.organizesort_edit.edit_type = OrganizeSortEditType::None;
                                         self.organizesort_edit.index = 0;
                                     }
@@ -367,14 +378,14 @@ impl eframe::App for SuperPatchApp {
                                         };
                                         new_orderdata.insert(insert_index, dragged_item);
                                         self.orderdata = Value::Array(new_orderdata);
-                                        (self.vfsdata, self.organizesort_list, self.vfssort_list) = update_data(self.orderdata.clone(), self.organizesort.clone(), self.vfssort.clone(), self.patchdata.clone());
+                                        (self.vfsdata, self.vfscache, self.organizesort_list, self.vfssort_list) = update_data(self.orderdata.clone(), self.organizesort.clone(), self.vfssort.clone(), self.patchdata.clone(), self.vfscache.clone());
                                     }
                                 }
                             }
                             response.context_menu(|ui| {
                                 if ui.button(if enabled { "Disable" } else { "Enable" }).clicked() {
                                     self.orderdata[row_index]["enabled"] = Value::Bool(!enabled);
-                                    (self.vfsdata, self.organizesort_list, self.vfssort_list) = update_data(self.orderdata.clone(), self.organizesort.clone(), self.vfssort.clone(), self.patchdata.clone());
+                                    (self.vfsdata, self.vfscache, self.organizesort_list, self.vfssort_list) = update_data(self.orderdata.clone(), self.organizesort.clone(), self.vfssort.clone(), self.patchdata.clone(), self.vfscache.clone());
                                     self.status = if enabled { "Disabled mod.".to_string() } else { "Enabled mod.".to_string() };
                                     ui.close();
                                 }
@@ -403,7 +414,7 @@ impl eframe::App for SuperPatchApp {
                                     fs::remove_dir_all(mod_entry.path.as_str()).expect("Failed to delete mod directory");
                                     }
                                     self.orderdata.as_array_mut().unwrap().remove(row_index);
-                                    (self.vfsdata, self.organizesort_list, self.vfssort_list) = update_data(self.orderdata.clone(), self.organizesort.clone(), self.vfssort.clone(), self.patchdata.clone());
+                                    (self.vfsdata, self.vfscache, self.organizesort_list, self.vfssort_list) = update_data(self.orderdata.clone(), self.organizesort.clone(), self.vfssort.clone(), self.patchdata.clone(), self.vfscache.clone());
                                     self.status = "Deleted mod.".to_string();
                                     ui.close();
                                 }
@@ -508,7 +519,7 @@ impl eframe::App for SuperPatchApp {
                                 if row.response().clicked() {
                                     if self.vfssort.expanded.contains(&path.to_string()) {
                                         self.vfssort.expanded.retain(|p| p != path);
-                                        //Refreshing vfssort_list immediately will crash as the list gets smaller but the UI is still referencing the larger size. Request refresh on next frame.
+                                        //Refreshing vfssort_list immediately will crash as the list gets smaller, but the UI is still referencing the larger size. Request refresh on the next frame.
                                         self.vfssort_list_refresh_requested = true;
                                     } else {
                                         self.vfssort.expanded.push(path.to_string());
@@ -523,6 +534,7 @@ impl eframe::App for SuperPatchApp {
                 //MARK: Patch Page
                 Tab::Patch => {
                     //TODO: Patch page
+                    ui.heading("Debug VFS Data");
                 }
             }
         });
@@ -534,7 +546,7 @@ fn main(){
         fs::create_dir(".superpatch").expect("Failed to create superpatch directory");
     }
     let orderdata = read_order_data();
-    let vfsdata = gen_vfs_data(orderdata.clone());
+    let (vfsdata, vfscache) = gen_vfs_data(orderdata.clone(), HashMap::new());
     let organizesort_list = sort_organize_data(orderdata.clone(), OrganizeSort::PriorityAsc);
     let settings = read_settings();
     let patchdata = read_patch_data();
@@ -549,7 +561,7 @@ fn main(){
             .with_maximized(settings["window_maximized"].as_bool().unwrap_or(false)),
         ..Default::default()
     };
-    let _ = eframe::run_native("Superpatch", native_options, Box::new(|cc| {Ok(Box::new(SuperPatchApp::new(cc, orderdata, vfsdata, organizesort_list, settings, vfssort_list, patchdata)))}));
+    let _ = eframe::run_native("Superpatch", native_options, Box::new(|cc| {Ok(Box::new(SuperPatchApp::new(cc, orderdata, vfsdata, vfscache, organizesort_list, settings, vfssort_list, patchdata)))}));
 }
 
 //MARK: Data Handling
@@ -563,66 +575,99 @@ fn read_order_data() -> Value {
     orderdata
 }
 
-fn gen_vfs_data(orderdata: Value) -> Value {
-    let mut vfsdata = Value::Object(Map::new());
-    for mod_entry in orderdata.as_array().unwrap_or(&vec![]) {
-        if mod_entry.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false) {
-            let mod_name = mod_entry.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            let mod_path_str = mod_entry.get("path").and_then(|v| v.as_str()).unwrap_or("");
-            let mod_path = Path::new(mod_path_str);
-            vfsdata = read_dir_recursive(mod_path, mod_path, vfsdata.clone(), mod_name);
-        }
-    }
-    vfsdata
-}
+fn gen_vfs_data(orderdata: Value, vfscache: HashMap<String, VFSNode>) -> (VFSTree, HashMap<String, VFSNode>) {
+    let mut vfsdata = VFSTree::new();
+    let mut vfscache = vfscache;
+    //PSEUDOCODE TIME!!!!
+    //For each mod in orderdata:
+        //If mod is not in vfscache, scan.
+    //For each mod enabled in orderdata:
+        //Merge vfscache with current vfsdata.
 
-fn read_dir_recursive(dir_path: &Path, origin_path: &Path, vfsdata: Value, current_mod: &str) -> Value {
-    //TODO: Handle DLTX patches
-    let mut new_vfsdata = vfsdata;
-    if dir_path.is_dir() {
-        for entry in fs::read_dir(dir_path).expect("Failed to read directory") {
-            let entry = entry.expect("Failed to get directory entry");
-            let path = entry.path();
-            let relative_path = pathdiff::diff_paths(&path, &origin_path).unwrap_or_else(|| path.clone());
-            let relative_path_str = relative_path.to_string_lossy().to_string();
-            let path_str = path.to_string_lossy().to_string();
-            if path.is_dir() {
-                if new_vfsdata[relative_path_str.clone()].is_null() {
-                    new_vfsdata.as_object_mut().unwrap().insert(relative_path_str.clone(), Value::Object(Map::new()));
-                }
-                new_vfsdata[relative_path_str] = read_dir_recursive(&path, origin_path, new_vfsdata[relative_path_str.clone()].clone(), current_mod);
+    for (i, mod_entry) in orderdata.as_array().unwrap().iter().enumerate() {
+        let name = mod_entry["name"].as_str().unwrap_or("");
+        let path = mod_entry["path"].as_str().unwrap_or("");
+        let enabled = mod_entry["enabled"].as_bool().unwrap_or(false);
+        if !vfscache.contains_key(name) {
+            if enabled {
+                vfscache.insert(name.to_string(), vfs_scan(path, path, VFSTree::new()));
             }
-            else if path.is_file() {
-                if new_vfsdata[relative_path_str.clone()].is_null() {
-                    let mut new_file_map = serde_json::Map::new();
-                    let mut file_object = serde_json::Map::new();
-                    file_object.insert(String::from(current_mod), Value::String(path_str.clone()));
-                    new_file_map.insert(String::from("paths"), Value::Object(file_object));
-                    new_vfsdata.as_object_mut().unwrap().insert(relative_path_str.clone(), Value::Object(new_file_map));
-                } else {
-                        new_vfsdata[relative_path_str]["paths"].as_object_mut().unwrap().insert(String::from(current_mod), Value::String(path_str.clone()));
-                }
+        } else {
+            if !enabled {
+                vfscache.remove(name);
             }
         }
     }
-    new_vfsdata
+    for (i, mod_entry) in orderdata.as_array().unwrap().iter().enumerate() {
+        let name = mod_entry["name"].as_str().unwrap_or("");
+        if let Some(vfsnode) = vfscache.get(name) {
+            vfsdata = merge_vfs_trees(vfsdata, vfsnode.clone());
+        }
+    }
+    (vfsdata, vfscache)
 }
 
-fn refresh_data(organizesort: OrganizeSort, vfssort: VFSSort, patchdata: Value) -> (Value, Value, Vec<OrganizeSortListEntry>, Vec<VFSSortListEntry>) {
+fn vfs_scan(path: &str, origin_path: &str, mut vfsdata: VFSTree) -> VFSNode {
+    //TODO: DLTX Patch support
+    if let Ok(entries) = fs::read_dir(path) {
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            let relative_path = pathdiff(&entry_path.to_str().unwrap_or(""), origin_path);
+            if entry_path.is_dir() {
+                let sub_vfsdata = vfs_scan(entry_path.to_str().unwrap_or(""), origin_path, VFSTree::new());
+                vfsdata.insert(relative_path, sub_vfsdata);
+            } else {
+                let mut file_node = VFSNode::File(VFSFile {
+                    paths: HashMap::new(),
+                    dltx_patches: HashMap::new(),
+                });
+                if let VFSNode::File(ref mut file_data) = file_node {
+                    file_data.paths.insert(path.to_string(), relative_path.clone());
+                }
+                vfsdata.insert(relative_path, file_node);
+            }
+        }
+    }
+    VFSNode::Dir(vfsdata)
+}
+
+fn merge_vfs_trees(mut tree1: VFSTree, tree2: VFSNode) -> VFSTree {
+    if let VFSNode::Dir(tree2_data) = tree2 {
+        for (key, value) in tree2_data {
+            if let Some(existing_node) = tree1.get_mut(&key) {
+                if let VFSNode::Dir(existing_tree) = existing_node {
+                    if let VFSNode::Dir(new_tree) = value {
+                        *existing_tree = merge_vfs_trees(existing_tree.clone(), VFSNode::Dir(new_tree));
+                    }
+                } else if let VFSNode::File(existing_file) = existing_node {
+                    if let VFSNode::File(new_file) = value {
+                        existing_file.paths.extend(new_file.paths);
+                        existing_file.dltx_patches.extend(new_file.dltx_patches);
+                    }
+                }
+            } else {
+                tree1.insert(key, value);
+            }
+        }
+    }
+    tree1
+}
+
+fn refresh_data(organizesort: OrganizeSort, vfssort: VFSSort, patchdata: Value) -> (Value, VFSTree, HashMap<String, VFSNode>, Vec<OrganizeSortListEntry>, Vec<VFSSortListEntry>) {
     let orderdata = read_order_data();
-    let vfsdata = gen_vfs_data(orderdata.clone());
+    let (vfsdata, vfscache) = gen_vfs_data(orderdata.clone(), HashMap::new());
     let organizesort_list = sort_organize_data(orderdata.clone(), organizesort);
     let vfssort_list = gen_vfs_sort_data(vfsdata.clone(), vfssort, patchdata);
-    (orderdata, vfsdata, organizesort_list, vfssort_list)
+    (orderdata, vfsdata, vfscache, organizesort_list, vfssort_list)
 }
 
-fn update_data(orderdata: Value, organizesort: OrganizeSort, vfssort: VFSSort, patchdata: Value) -> (Value, Vec<OrganizeSortListEntry>, Vec<VFSSortListEntry>) {
-    let vfsdata = gen_vfs_data(orderdata.clone());
+fn update_data(orderdata: Value, organizesort: OrganizeSort, vfssort: VFSSort, patchdata: Value, vfscache: HashMap<String, VFSNode>) -> (VFSTree, HashMap<String, VFSNode>, Vec<OrganizeSortListEntry>, Vec<VFSSortListEntry>) {
+    let (vfsdata, vfscache) = gen_vfs_data(orderdata.clone(), vfscache);
     let text = serde_json::to_string_pretty(&orderdata).expect("Failed to serialize order.json");
     fs::write(".superpatch/order.json", text).expect("Failed to write order.json");
     let organizesort_list = sort_organize_data(orderdata, organizesort);
     let vfssort_list = gen_vfs_sort_data(vfsdata.clone(), vfssort, patchdata);
-    (vfsdata, organizesort_list, vfssort_list)
+    (vfsdata, vfscache, organizesort_list, vfssort_list)
 }
 
 fn sort_organize_data(orderdata: Value, organizesort: OrganizeSort) -> Vec<OrganizeSortListEntry> {
@@ -656,7 +701,7 @@ fn install_mod(file_path: &Path) {
     //Autodetect root (how)
     //Autodetect multiple roots & prompt (how)
     //fomod Wizard (https://nexus-mods.github.io/NexusMods.App/developers/misc/AboutFomod/)
-    //BAIN Wizard (https://wrye-bash.github.io/docs/Wrye%20Bash%20Technical%20Readme.html) (i've never seen this)
+    //BAIN Wizard (https://wrye-bash.github.io/docs/Wrye%20Bash%20Technical%20Readme.html) (I've never seen this)
     //
     //Strange edgecases: Just look at Anomaly_DevTools. \ is a character somehow??
 }
@@ -681,7 +726,7 @@ fn read_patch_data() -> Value {
     patchdata
 }
 
-fn gen_vfs_sort_data(vfsdata: Value, vfssort: VFSSort, patchdata: Value) -> Vec<VFSSortListEntry> {
+fn gen_vfs_sort_data(vfsdata: VFSTree, vfssort: VFSSort, patchdata: Value) -> Vec<VFSSortListEntry> {
     //TODO: Generate VFS sort data
     //My name is pseudocode I am here to help
     //Iterate through vfsdata
@@ -695,18 +740,17 @@ fn gen_vfs_sort_data(vfsdata: Value, vfssort: VFSSort, patchdata: Value) -> Vec<
     gen_vfs_sort_data_recursive(vfsdata, vfssort, String::new(), 0, patchdata)
 }
 
-fn gen_vfs_sort_data_recursive(vfsdata: Value, vfssort: VFSSort, current_path: String, current_down: i64, patchdata: Value) -> Vec<VFSSortListEntry> {
+fn gen_vfs_sort_data_recursive(vfsdata: VFSTree, vfssort: VFSSort, current_path: String, current_down: i64, patchdata: Value) -> Vec<VFSSortListEntry> {
     let mut vfssortlist = Vec::new();
-    for (key, value) in vfsdata.as_object().unwrap_or(&Map::new()) {
-        let name = pathdiff::diff_paths(Path::new(key), Path::new(&current_path)).unwrap_or_else(|| Path::new(key).to_path_buf()).to_string_lossy().to_string();
-        if value.get("paths").is_some() {
-            //It's a file
-            let file_type = Path::new(key).extension().and_then(|s| s.to_str()).unwrap_or("file").to_string();
-            let mut conflicts = value["paths"].as_object().map(|o| o.len()).unwrap_or(0).try_into().unwrap_or(0);
+    for (key, value) in vfsdata {
+        let name = pathdiff(&key, &current_path);
+        if let VFSNode::File(file) = value {
+            let file_type = Path::new(&key).extension().and_then(|s| s.to_str()).unwrap_or("file").to_string();
+            let mut conflicts = file.paths.len().try_into().unwrap_or(0);
             if conflicts == 1 {
-                conflicts = 0; //If there's only one path, it's not a conflict
+                conflicts = 0;
             }
-            let dltx_patches = value["dltx_patches"].as_array().map(|a| a.len()).unwrap_or(0).try_into().unwrap_or(0);
+            let dltx_patches = file.dltx_patches.len().try_into().unwrap_or(0);
             //TODO: Check if the file is patched and how many DLTXs remain active (reference patchdata)
             let dltx_patches_active = dltx_patches;
             let patched = false;
@@ -722,7 +766,6 @@ fn gen_vfs_sort_data_recursive(vfsdata: Value, vfssort: VFSSort, current_path: S
                 patched
             });
         } else {
-            //It's a folder
             let extended = vfssort.expanded.contains(&key);
             vfssortlist.push(VFSSortListEntry {
                 path: key.clone(),
@@ -736,7 +779,9 @@ fn gen_vfs_sort_data_recursive(vfsdata: Value, vfssort: VFSSort, current_path: S
                 patched: false
             });
             if extended {
-                vfssortlist.extend(gen_vfs_sort_data_recursive(value.clone(), vfssort.clone(), key.clone(), current_down + 1, patchdata.clone()));
+                if let VFSNode::Dir(children) = value {
+                    vfssortlist.extend(gen_vfs_sort_data_recursive(children.clone(), vfssort.clone(), key.clone(), current_down + 1, patchdata.clone()));
+                }
             }
         }
     }
@@ -746,4 +791,9 @@ fn gen_vfs_sort_data_recursive(vfsdata: Value, vfssort: VFSSort, current_path: S
 fn save_settings(settings: Value) {
     let text = serde_json::to_string_pretty(&settings).expect("Failed to serialize settings.json");
     fs::write(".superpatch/settings.json", text).expect("Failed to write settings.json");
+}
+
+fn pathdiff(path: &str, reference: &str) -> String {
+    //Does this work on windows?
+    path.strip_prefix(&format!("{}/", reference)).unwrap_or(path).to_string()
 }
