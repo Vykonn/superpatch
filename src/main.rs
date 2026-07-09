@@ -210,7 +210,7 @@ impl eframe::App for SuperPatchApp {
                         (self.orderdata, self.vfsdata, self.vfscache, self.organizesort_list, self.vfssort_list) = refresh_data(self.organizesort.clone(), self.vfssort.clone(), self.patchdata.clone());       
                     }
                     if ui.button("Save VFS Changes").clicked() {
-                        save_vfs_changes();
+                        save_vfs_changes(Path::new(""));
                     }
                     if ui.button("Quit").clicked() {
                         ui.send_viewport_cmd(egui::ViewportCommand::Close);
@@ -280,7 +280,7 @@ impl eframe::App for SuperPatchApp {
                     let game_path = self.settings["game_path"].as_str().unwrap_or("");
                     let game_vfsdata = vfs_scan(game_path, game_path, VFSTree::new());
                     vfsdata_active = merge_vfs_trees(vfsdata_active, game_vfsdata);
-                    save_vfs_changes();
+                    save_vfs_changes(Path::new(""));
                     let real_vfs_path = realize_vfs_data(vfsdata_active, self.patchdata.clone());
                     let game_command = self.settings["game_command"].as_str().unwrap_or("").replace("%path%", real_vfs_path.to_str().unwrap_or(""));
                     println!("Launching game with command: {}", game_command);
@@ -1089,16 +1089,69 @@ fn realize_vfs_data(vfsdata: VFSTree, patchdata: Value) -> PathBuf {
     }
     fs::create_dir(".vfs").expect("Failed to create .vfs directory");
     let vfs_dir = std::env::current_dir().expect("Failed to get current directory").join(".vfs");
-    hard_link_vfs_data_recursive(vfsdata, &vfs_dir, patchdata);
-    //TODO Launch: Save file structure to .txt
-    //TODO Launch: Link saved file structure to .vfs
+    link_vfs_data_recursive(vfsdata, &vfs_dir, patchdata);
+    //Rejoin .saved files to .vfs
+    fetch_saved_vfs_changes(Path::new(""));
     vfs_dir
 }
-fn save_vfs_changes() {
-    //TODO Launch: Move any new files to .saved and symlink them back to .vfs
+fn save_vfs_changes(mut current_dir: &Path) {
+    if current_dir == "" {
+        let vfs_dir = Path::new(".vfs");
+        if !vfs_dir.exists() {
+            return;
+        } else {
+            current_dir = vfs_dir;
+        }
+    }
+    for entry in fs::read_dir(current_dir).expect("Failed to read current directory") {
+        let entry = entry.expect("Failed to read directory entry");
+        let path = entry.path();
+        if path.is_dir() {
+            save_vfs_changes(&path);
+        } else if path.is_file() {
+            if !path.is_dir() {
+                let metadata = fs::symlink_metadata(&path).expect("Failed to get file metadata");
+                if !metadata.is_symlink() {
+                    let relative_path = pathdiff(&path.to_str().unwrap_or(""), ".vfs");
+                    let saved_path = Path::new(".saved").join(&relative_path);
+                    fs::create_dir_all(Path::new(".saved").join(&relative_path).parent().unwrap()).expect("Failed to create .saved directory");
+                    fs::copy(&path, &saved_path).expect("Failed to copy modified file to .saved");
+                    fs::remove_file(&path).expect("Failed to remove modified file from .vfs");
+                    link_that_file(&saved_path.canonicalize().unwrap(), &path);
+                    
+                }
+            }
+        }
+    }
 }
 
-fn hard_link_vfs_data_recursive(vfsdata: VFSTree, origin_path: &Path, patchdata: Value) {
+fn fetch_saved_vfs_changes(mut current_dir: &Path) {
+    if current_dir == "" {
+        let saved_dir = Path::new(".saved");
+        if !saved_dir.exists() {
+            return;
+        } else {
+            current_dir = saved_dir;
+        }
+    }
+    for entry in fs::read_dir(current_dir).expect("Failed to read current directory") {
+        let entry = entry.expect("Failed to read directory entry");
+        let path = entry.path();
+        if path.is_dir() {
+            fetch_saved_vfs_changes(&path);
+        } else if path.is_file() {
+            let relative_path = pathdiff(&path.to_str().unwrap_or(""), ".saved");
+            let vfs_path = Path::new(".vfs").join(&relative_path);
+            if vfs_path.exists() {
+                fs::remove_file(&vfs_path).expect("Failed to remove existing file in .vfs");
+            }
+            fs::create_dir_all(vfs_path.parent().unwrap()).expect("Failed to create parent directories in .vfs");
+            link_that_file(&path.canonicalize().unwrap(), &vfs_path);
+        }
+    }
+}
+
+fn link_vfs_data_recursive(vfsdata: VFSTree, origin_path: &Path, patchdata: Value) {
     for (key, value) in vfsdata {
         let new_path = origin_path.join(&key);
         if let VFSNode::File(file) = value {
@@ -1106,7 +1159,7 @@ fn hard_link_vfs_data_recursive(vfsdata: VFSTree, origin_path: &Path, patchdata:
             link_that_file(&PathBuf::from(source_path), &new_path);
         } else if let VFSNode::Dir(children) = value {
             fs::create_dir_all(&new_path).expect("Failed to create directory");
-            hard_link_vfs_data_recursive(children, origin_path, patchdata.clone());
+            link_vfs_data_recursive(children, origin_path, patchdata.clone());
         }
     }
 }
