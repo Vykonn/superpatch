@@ -1,5 +1,5 @@
 use std::{collections::{BTreeMap, HashMap}, path::PathBuf, process::Command};
-use eframe::egui::{self};
+use eframe::egui::{self, Id, Modal};
 use ordered_hash_map::OrderedHashMap;
 use serde_json::{Value};
 use std::fs;
@@ -179,16 +179,85 @@ impl eframe::App for SuperPatchApp {
                 save_settings(self.settings.clone());
             }
         }
+        //MARK: Wine Modal
+        //TODO Tools: Install / detect wine or proton and set up wineprefix for the game. (Linux only)
+        //GET WINE
+        //Getting wine: Is steam installed?
+            //Yes: Is a version of proton above 10.0 installed?
+                //Yes: Use that.
+                //No: Install proton 10.0.
+            //No: Is wine installed?
+                //Yes: Use that.
+                //No: Install wine.
+        //Prefix setup:
+        //Create new prefix.
+        //Get winetricks
+        //Install cmd d3dcompiler_47 d3dx10 d3dx11_43 d3dx9 dx8vb quartz vcrun2022 dxvk
+        #[cfg(target_os = "linux")]
+        {
+            if self.livedata.get("wine_modal_open").map_or(false, |v| matches!(v, DataOptions::String(s) if s == "true")) {
+                let wine_modal = Modal::new(Id::new("wine_modal")).show(ui.ctx(), |ui| {
+                    ui.heading("Wine Setup");
+                    ui.label("This feature is not yet implemented.");
+                });
+                if wine_modal.should_close() {
+                    self.livedata.insert("wine_modal_open".to_string(), DataOptions::String("false".to_string()));
+                }
+            }
+        }
+        //MARK: Modded EXEs Modal
+        //TODO Tools: Install latest modded EXEs.
+        if self.livedata.get("modded_exes_modal_open").map_or(false, |v| matches!(v, DataOptions::String(s) if s == "true")) {
+            let modded_exes_modal = Modal::new(Id::new("modded_exes_modal")).show(ui.ctx(), |ui| {
+                ui.heading("Install Modded EXEs");
+                ui.label("This feature is not yet implemented.");
+            });
+            if modded_exes_modal.should_close() {
+                self.livedata.insert("modded_exes_modal_open".to_string(), DataOptions::String("false".to_string()));
+            }
+        }
+        //MARK: Import Modal
+        //TODO Mods: Import from MO2
+        //Modal
+        //MO2 Path
+        //Instance Path
+        //Start/Cancel
+        if self.livedata.get("import_modal_open").map_or(false, |v| matches!(v, DataOptions::String(s) if s == "true")) {
+            let import_modal = Modal::new(Id::new("import_modal")).show(ui.ctx(), |ui| {
+                ui.heading("Import from MO2");
+                ui.label("This feature is not yet implemented.");
+            });
+            if import_modal.should_close() {
+                self.livedata.insert("import_modal_open".to_string(), DataOptions::String("false".to_string()));
+            }
+        }
+        //MARK: Installation Modal
+        //TODO Mods: Add mod (complicated)
+        //Basic installer (choose root directory) (upgrade with multiple roots)
+        //Autodetect root (how)
+        //Autodetect multiple roots & prompt (how)
+        //fomod Wizard (https://nexus-mods.github.io/NexusMods.App/developers/misc/AboutFomod/)
+        //BAIN Wizard (https://wrye-bash.github.io/docs/Wrye%20Bash%20Technical%20Readme.html) (I've never seen this)
+        //
+        //Strange edgecases: Just look at Anomaly_DevTools. \ is a character somehow??
+        //
+        //This is going to need to be a window somehow. How?
+        if self.livedata.get("install_modal_open").map_or(false, |v| matches!(v, DataOptions::String(s) if s == "true")) {
+            let install_modal = Modal::new(Id::new("install_modal")).show(ui.ctx(), |ui| {
+                ui.heading("Install Mod");
+                ui.label("This feature is not yet implemented.");
+            });
+            if install_modal.should_close() {
+                self.livedata.insert("install_modal_open".to_string(), DataOptions::String("false".to_string()));
+            }
+        }
         //MARK: Menu Bar
         egui::Panel::top("top_bar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("Import").clicked() {
-                        //TODO Mods: Import from MO2
-                        //Modal
-                            //MO2 Path
-                            //Instance Path
-                            //Start/Cancel
+
+                        self.livedata.insert("import_modal_open".to_string(), DataOptions::String("true".to_string()));
                     }
                     if ui.button("Add mod").clicked() {
                         let path = DialogBuilder::file()
@@ -202,8 +271,7 @@ impl eframe::App for SuperPatchApp {
                             .show()
                             .unwrap();
                         if path.is_some() {
-                           self.orderdata.as_array_mut().unwrap().push(install_mod(path.as_ref().unwrap()));
-                           (self.vfsdata, self.vfscache, self.organizesort_list, self.vfssort_list) = update_data(self.orderdata.clone(), self.organizesort.clone(), self.vfssort.clone(), self.patchdata.clone(), self.vfscache.clone());
+                            self.livedata.insert("install_modal_open".to_string(), DataOptions::String("true".to_string()));
                         }
                     }
                     if ui.button("Refresh").clicked() {
@@ -220,23 +288,12 @@ impl eframe::App for SuperPatchApp {
                     #[cfg(target_os = "linux")]
                     {
                     if ui.button("Setup Wine").clicked() {
-                        //TODO Tools: Install / detect wine or proton and set up wineprefix for the game. (Linux only)
-                        //GET WINE
-                        //Getting wine: Is steam installed?
-                            //Yes: Is a version of proton above 10.0 installed?
-                                //Yes: Use that.
-                                //No: Install proton 10.0.
-                            //No: Is wine installed?
-                                //Yes: Use that.
-                                //No: Install wine.
-                        //Prefix setup:
-                        //Create new prefix.
-                        //Get winetricks
-                        //Install cmd d3dcompiler_47 d3dx10 d3dx11_43 d3dx9 dx8vb quartz vcrun2022 dxvk
-                        let wine_path = "/home/charlie/.steam/steam/steamapps/common/Proton 10.0/files/bin/wine64";
+
+                        self.livedata.insert("wine_modal_open".to_string(), DataOptions::String("true".to_string()));
                     }
                     if ui.button("Install Modded EXEs").clicked() {
-                        //TODO Tools: Install latest modded EXEs.
+                        
+                        self.livedata.insert("modded_exes_modal_open".to_string(), DataOptions::String("true".to_string()));
                     }
                     }
                 });
@@ -398,6 +455,7 @@ impl eframe::App for SuperPatchApp {
                     .column(Column::initial(original_widths[2].as_f64().unwrap_or(100.0) as f32).resizable(true).at_least(100.0).clip(true))
                     .column(Column::initial(original_widths[3].as_f64().unwrap_or(100.0) as f32).resizable(true).at_least(100.0).clip(true))
                     .column(Column::remainder().at_least(100.0).clip(true))
+                    //MARK: Headers
                     .header(20.0, |mut header| {
                         header.col(|ui| { ui.label("Enabled"); });
                         header.col(|ui| {
@@ -462,6 +520,7 @@ impl eframe::App for SuperPatchApp {
                             });
                         });
                     })
+                    //MARK: Body
                     .body(|mut body |{
                         let row_height = 20.0;
                         let num_rows = self.organizesort_list.len();
@@ -663,6 +722,7 @@ impl eframe::App for SuperPatchApp {
                             });
                         });
                     });
+                    //MARK: Extras
                     // Drag and Drop display
                     if egui::DragAndDrop::has_payload_of_type::<i64>(ui.ctx()) {
                         let payload = *egui::DragAndDrop::payload::<i64>(ui.ctx()).unwrap();
@@ -761,6 +821,7 @@ impl eframe::App for SuperPatchApp {
                 //MARK: Patch Page
                 Tab::Patch => {
                     //TODO Patch: Patch page
+                    ui.label("This feature is not yet implemented.");
                 }
             }
         });
@@ -801,6 +862,49 @@ fn read_order_data() -> Value {
     orderdata
 }
 
+fn refresh_data(organizesort: OrganizeSort, vfssort: VFSSort, patchdata: Value) -> (Value, VFSTree, HashMap<String, VFSNode>, Vec<OrganizeSortListEntry>, Vec<VFSSortListEntry>) {
+    let orderdata = read_order_data();
+    let (vfsdata, vfscache) = gen_vfs_data(orderdata.clone(), HashMap::new());
+    let organizesort_list = sort_organize_data(orderdata.clone(), organizesort);
+    let vfssort_list = gen_vfs_sort_data(vfsdata.clone(), vfssort, patchdata);
+    (orderdata, vfsdata, vfscache, organizesort_list, vfssort_list)
+}
+
+fn update_data(orderdata: Value, organizesort: OrganizeSort, vfssort: VFSSort, patchdata: Value, vfscache: HashMap<String, VFSNode>) -> (VFSTree, HashMap<String, VFSNode>, Vec<OrganizeSortListEntry>, Vec<VFSSortListEntry>) {
+    let (vfsdata, vfscache) = gen_vfs_data(orderdata.clone(), vfscache);
+    let text = serde_json::to_string_pretty(&orderdata).expect("Failed to serialize order.json");
+    fs::write("configs/order.json", text).expect("Failed to write order.json");
+    let organizesort_list = sort_organize_data(orderdata, organizesort);
+    let vfssort_list = gen_vfs_sort_data(vfsdata.clone(), vfssort, patchdata);
+    (vfsdata, vfscache, organizesort_list, vfssort_list)
+}
+
+fn read_settings() -> Value {
+    let settings_path = Path::new("configs/settings.json");
+    if !Path::exists(settings_path) {
+        fs::write(settings_path, "{}").expect("Failed to create settings.json");
+    }
+    let settings_str = fs::read_to_string(settings_path).expect("Failed to read settings.json");
+    let settings: Value = serde_json::from_str(&settings_str).expect("Failed to parse settings.json");
+    settings
+}
+
+fn read_patch_data() -> Value {
+    let patchdata_path = Path::new("configs/patch.json");
+    if !Path::exists(patchdata_path) {
+        fs::write(patchdata_path, "{}").expect("Failed to create patch.json");
+    }
+    let patchdata_str = fs::read_to_string(patchdata_path).expect("Failed to read patch.json");
+    let patchdata: Value = serde_json::from_str(&patchdata_str).expect("Failed to parse patch.json");
+    patchdata
+}
+
+fn save_settings(settings: Value) {
+    let text = serde_json::to_string_pretty(&settings).expect("Failed to serialize settings.json");
+    fs::write("configs/settings.json", text).expect("Failed to write settings.json");
+}
+
+//MARK: VFS Generation
 fn gen_vfs_data(orderdata: Value, vfscache: HashMap<String, VFSNode>) -> (VFSTree, HashMap<String, VFSNode>) {
     let mut vfsdata = VFSTree::new();
     let mut vfscache = vfscache;
@@ -880,83 +984,7 @@ fn merge_vfs_trees(mut tree1: VFSTree, tree2: VFSNode) -> VFSTree {
     }
     tree1
 }
-
-fn refresh_data(organizesort: OrganizeSort, vfssort: VFSSort, patchdata: Value) -> (Value, VFSTree, HashMap<String, VFSNode>, Vec<OrganizeSortListEntry>, Vec<VFSSortListEntry>) {
-    let orderdata = read_order_data();
-    let (vfsdata, vfscache) = gen_vfs_data(orderdata.clone(), HashMap::new());
-    let organizesort_list = sort_organize_data(orderdata.clone(), organizesort);
-    let vfssort_list = gen_vfs_sort_data(vfsdata.clone(), vfssort, patchdata);
-    (orderdata, vfsdata, vfscache, organizesort_list, vfssort_list)
-}
-
-fn update_data(orderdata: Value, organizesort: OrganizeSort, vfssort: VFSSort, patchdata: Value, vfscache: HashMap<String, VFSNode>) -> (VFSTree, HashMap<String, VFSNode>, Vec<OrganizeSortListEntry>, Vec<VFSSortListEntry>) {
-    let (vfsdata, vfscache) = gen_vfs_data(orderdata.clone(), vfscache);
-    let text = serde_json::to_string_pretty(&orderdata).expect("Failed to serialize order.json");
-    fs::write("configs/order.json", text).expect("Failed to write order.json");
-    let organizesort_list = sort_organize_data(orderdata, organizesort);
-    let vfssort_list = gen_vfs_sort_data(vfsdata.clone(), vfssort, patchdata);
-    (vfsdata, vfscache, organizesort_list, vfssort_list)
-}
-
-fn sort_organize_data(orderdata: Value, organizesort: OrganizeSort) -> Vec<OrganizeSortListEntry> {
-    let mut orderdata_array = orderdata.as_array().cloned().unwrap_or_else(Vec::new);
-    let mut organizesortlist = Vec::new();
-    //Add priority field
-    for (i, item) in orderdata_array.iter_mut().enumerate() {
-        organizesortlist.push(OrganizeSortListEntry {
-            enabled: item.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false),
-            name: item.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            category: item.get("category").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            version: item.get("version").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            priority: i as i64,
-            path: item.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-        });
-    }
-    match organizesort {
-        OrganizeSort::NameAsc => organizesortlist.sort_by(|a, b| a.name.cmp(&b.name)),
-        OrganizeSort::NameDesc => organizesortlist.sort_by(|a, b| b.name.cmp(&a.name)),
-        OrganizeSort::CategoryAsc => organizesortlist.sort_by(|a, b| a.category.cmp(&b.category)),
-        OrganizeSort::CategoryDesc => organizesortlist.sort_by(|a, b| b.category.cmp(&a.category)),
-        OrganizeSort::PriorityAsc => organizesortlist.sort_by(|a, b| a.priority.cmp(&b.priority)),
-        OrganizeSort::PriorityDesc => organizesortlist.sort_by(|a, b| b.priority.cmp(&a.priority)),
-    }
-    organizesortlist
-}
-
-fn install_mod(file_path: &Path) -> Value {
-    //TODO Mods: Add mod (complicated)
-    //Basic installer (choose root directory) (upgrade with multiple roots)
-    //Autodetect root (how)
-    //Autodetect multiple roots & prompt (how)
-    //fomod Wizard (https://nexus-mods.github.io/NexusMods.App/developers/misc/AboutFomod/)
-    //BAIN Wizard (https://wrye-bash.github.io/docs/Wrye%20Bash%20Technical%20Readme.html) (I've never seen this)
-    //
-    //Strange edgecases: Just look at Anomaly_DevTools. \ is a character somehow??
-    //
-    //This is going to need to be a window somehow. How?
-    Value::Object(serde_json::Map::new())
-}
-
-fn read_settings() -> Value {
-    let settings_path = Path::new("configs/settings.json");
-    if !Path::exists(settings_path) {
-        fs::write(settings_path, "{}").expect("Failed to create settings.json");
-    }
-    let settings_str = fs::read_to_string(settings_path).expect("Failed to read settings.json");
-    let settings: Value = serde_json::from_str(&settings_str).expect("Failed to parse settings.json");
-    settings
-}
-
-fn read_patch_data() -> Value {
-    let patchdata_path = Path::new("configs/patch.json");
-    if !Path::exists(patchdata_path) {
-        fs::write(patchdata_path, "{}").expect("Failed to create patch.json");
-    }
-    let patchdata_str = fs::read_to_string(patchdata_path).expect("Failed to read patch.json");
-    let patchdata: Value = serde_json::from_str(&patchdata_str).expect("Failed to parse patch.json");
-    patchdata
-}
-
+//MARK: VFS Sorting
 fn gen_vfs_sort_data(vfsdata: VFSTree, vfssort: VFSSort, patchdata: Value) -> Vec<VFSSortListEntry> {
     let mut vfssortlist = gen_vfs_sort_data_recursive(vfsdata, vfssort.clone(), String::new(), 0, patchdata);
     vfs_sort_data_prune_files(&mut vfssortlist, vfssort.clone());
@@ -1058,29 +1086,7 @@ fn vfs_sort_data_prune_folders(vfssortlist:&mut Vec<VFSSortListEntry>, vfssort: 
         }
     }
 }
-
-fn is_descendant_path(path: &str, ancestor: &str) -> bool {
-    path != ancestor
-        && path
-            .strip_prefix(ancestor)
-            .map(|suffix| suffix.starts_with('/'))
-            .unwrap_or(false)
-}
-
-fn save_settings(settings: Value) {
-    let text = serde_json::to_string_pretty(&settings).expect("Failed to serialize settings.json");
-    fs::write("configs/settings.json", text).expect("Failed to write settings.json");
-}
-
-fn pathdiff(path: &str, reference: &str) -> String {
-    //Does this work on windows?
-    if reference.ends_with('/') {
-        return path.strip_prefix(reference).unwrap_or(path).to_string();
-    } else {
-        return path.strip_prefix(&format!("{}/", reference)).unwrap_or(path).to_string();
-    }
-}
-
+//MARK: VFS Realization
 fn realize_vfs_data(vfsdata: VFSTree, patchdata: Value) -> PathBuf {
     //TODO Patch: Realize patchdata
 
@@ -1089,11 +1095,25 @@ fn realize_vfs_data(vfsdata: VFSTree, patchdata: Value) -> PathBuf {
     }
     fs::create_dir(".vfs").expect("Failed to create .vfs directory");
     let vfs_dir = std::env::current_dir().expect("Failed to get current directory").join(".vfs");
+    //HACK Launch: This implementation will NOT work for hardlinks.
     link_vfs_data_recursive(vfsdata, &vfs_dir, patchdata);
-    //Rejoin .saved files to .vfs
     fetch_saved_vfs_changes(Path::new(""));
     vfs_dir
 }
+
+fn link_vfs_data_recursive(vfsdata: VFSTree, origin_path: &Path, patchdata: Value) {
+    for (key, value) in vfsdata {
+        let new_path = origin_path.join(&key);
+        if let VFSNode::File(file) = value {
+            let source_path = file.paths.iter().last().unwrap().1;
+            link_that_file(&PathBuf::from(source_path), &new_path);
+        } else if let VFSNode::Dir(children) = value {
+            fs::create_dir_all(&new_path).expect("Failed to create directory");
+            link_vfs_data_recursive(children, origin_path, patchdata.clone());
+        }
+    }
+}
+
 fn save_vfs_changes(mut current_dir: &Path) {
     if current_dir == "" {
         let vfs_dir = Path::new(".vfs");
@@ -1151,21 +1171,58 @@ fn fetch_saved_vfs_changes(mut current_dir: &Path) {
     }
 }
 
-fn link_vfs_data_recursive(vfsdata: VFSTree, origin_path: &Path, patchdata: Value) {
-    for (key, value) in vfsdata {
-        let new_path = origin_path.join(&key);
-        if let VFSNode::File(file) = value {
-            let source_path = file.paths.iter().last().unwrap().1;
-            link_that_file(&PathBuf::from(source_path), &new_path);
-        } else if let VFSNode::Dir(children) = value {
-            fs::create_dir_all(&new_path).expect("Failed to create directory");
-            link_vfs_data_recursive(children, origin_path, patchdata.clone());
-        }
+
+//MARK: Organize Sorting
+fn sort_organize_data(orderdata: Value, organizesort: OrganizeSort) -> Vec<OrganizeSortListEntry> {
+    let mut orderdata_array = orderdata.as_array().cloned().unwrap_or_else(Vec::new);
+    let mut organizesortlist = Vec::new();
+    //Add priority field
+    for (i, item) in orderdata_array.iter_mut().enumerate() {
+        organizesortlist.push(OrganizeSortListEntry {
+            enabled: item.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false),
+            name: item.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            category: item.get("category").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            version: item.get("version").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            priority: i as i64,
+            path: item.get("path").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+        });
+    }
+    match organizesort {
+        OrganizeSort::NameAsc => organizesortlist.sort_by(|a, b| a.name.cmp(&b.name)),
+        OrganizeSort::NameDesc => organizesortlist.sort_by(|a, b| b.name.cmp(&a.name)),
+        OrganizeSort::CategoryAsc => organizesortlist.sort_by(|a, b| a.category.cmp(&b.category)),
+        OrganizeSort::CategoryDesc => organizesortlist.sort_by(|a, b| b.category.cmp(&a.category)),
+        OrganizeSort::PriorityAsc => organizesortlist.sort_by(|a, b| a.priority.cmp(&b.priority)),
+        OrganizeSort::PriorityDesc => organizesortlist.sort_by(|a, b| b.priority.cmp(&a.priority)),
+    }
+    organizesortlist
+}
+
+
+//MARK: Tools
+fn pathdiff(path: &str, reference: &str) -> String {
+    //TODO General: Does this work on windows?
+    if reference.ends_with('/') {
+        return path.strip_prefix(reference).unwrap_or(path).to_string();
+    } else {
+        return path.strip_prefix(&format!("{}/", reference)).unwrap_or(path).to_string();
     }
 }
 
+fn is_descendant_path(path: &str, ancestor: &str) -> bool {
+    path != ancestor
+        && path
+            .strip_prefix(ancestor)
+            .map(|suffix| suffix.starts_with('/'))
+            .unwrap_or(false)
+}
+
 fn link_that_file(source: &Path, destination: &Path) {
-    if let Err(e) = std::os::unix::fs::symlink(source, destination) {
-        eprintln!("Failed to create symlink from {:?} to {:?}: {}", source, destination, e);
+    #[cfg(target_family = "unix")]
+    {
+        if let Err(e) = std::os::unix::fs::symlink(source, destination) {
+            eprintln!("Failed to create symlink from {:?} to {:?}: {}", source, destination, e);
+        }
     }
+    //TODO Launch: Windows. Symlink = Admin, Hardlink = Need new save_vfs_changes implementation
 }
