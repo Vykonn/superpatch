@@ -439,7 +439,7 @@ impl eframe::App for SuperPatchApp {
                 ui.label(self.status.clone());
                 match self.selected_tab {
                     Tab::Organize => {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |_ui| {
                             //TODO General: Search bar for organize Tab
                         });
                     }
@@ -513,7 +513,7 @@ impl eframe::App for SuperPatchApp {
         });
         //MARK: Patch Left Panel
         if self.selected_tab == Tab::Patch {
-            egui::Panel::left("left_panel").show(ui, |ui| {});
+            egui::Panel::left("left_panel").show(ui, |_ui| {});
         }
 
         egui::CentralPanel::default().show(ui, |ui| {
@@ -723,9 +723,9 @@ impl eframe::App for SuperPatchApp {
                                 };
 
                                 if let Some(dragged_payload) = row.response().dnd_release_payload::<i64>() {
-                                    let dragged_index = *Some(dragged_payload).unwrap();
+                                    let dragged_index = *dragged_payload;
                                     if self.organizesort == OrganizeSort::PriorityDesc {
-                                            insert_row_index = self.orderdata.as_array().cloned().unwrap_or_else(Vec::new).len() as usize - insert_row_index;
+                                            insert_row_index = self.orderdata.as_array().cloned().unwrap_or_else(Vec::new).len() - insert_row_index;
                                     }
                                     if dragged_index != priority {
                                         let mut new_orderdata = self.orderdata.as_array().cloned().unwrap_or_else(Vec::new);
@@ -884,8 +884,8 @@ impl eframe::App for SuperPatchApp {
                                     ui.label(dltx_patches.to_string());
                                 }
                             });
-                            if file_type == "folder" {
-                                if row.response().clicked() {
+                            if file_type == "folder"
+                                && row.response().clicked() {
                                     if self.vfssort.expanded.contains(&path.to_string()) {
                                         self.vfssort.expanded.retain(|p| p != path);
                                         //Refreshing vfssort_list immediately will crash as the list gets smaller, but the UI is still referencing the larger size. Request refresh on the next frame.
@@ -895,7 +895,6 @@ impl eframe::App for SuperPatchApp {
                                         self.vfssort_list = gen_vfs_sort_data(self.vfsdata.clone(), self.vfssort.clone(), self.patchdata.clone());
                                     }
                                 }
-                            }
                         });
                     });
 
@@ -1051,7 +1050,7 @@ fn gen_vfs_data(
 ) -> (VFSTree, HashMap<String, VFSNode>) {
     let mut vfsdata = VFSTree::new();
     let mut vfscache = vfscache;
-    for (_i, mod_entry) in orderdata.as_array().unwrap().iter().enumerate() {
+    for mod_entry in orderdata.as_array().unwrap().iter() {
         let name = mod_entry["name"].as_str().unwrap_or("");
         let path = mod_entry["path"].as_str().unwrap_or("");
         let enabled = mod_entry["enabled"].as_bool().unwrap_or(false);
@@ -1079,7 +1078,7 @@ fn gen_vfs_data(
     for name in stale_keys {
         vfscache.remove(&name);
     }
-    for (_i, mod_entry) in orderdata.as_array().unwrap().iter().enumerate() {
+    for mod_entry in orderdata.as_array().unwrap().iter() {
         let name = mod_entry["name"].as_str().unwrap_or("");
         if let Some(vfsnode) = vfscache.get(name) {
             vfsdata = merge_vfs_trees(vfsdata, vfsnode.clone());
@@ -1093,7 +1092,7 @@ fn vfs_scan(path: &str, origin_path: &str, mut vfsdata: VFSTree) -> VFSNode {
     if let Ok(entries) = fs::read_dir(path) {
         for entry in entries.flatten() {
             let entry_path = entry.path();
-            let relative_path = pathdiff(&entry_path.to_string_lossy().to_string(), origin_path);
+            let relative_path = pathdiff(entry_path.to_string_lossy().as_ref(), origin_path);
             if entry_path.is_dir() {
                 let sub_vfsdata = vfs_scan(
                     entry_path.to_str().unwrap_or(""),
@@ -1128,12 +1127,11 @@ fn merge_vfs_trees(mut tree1: VFSTree, tree2: VFSNode) -> VFSTree {
                         *existing_tree =
                             merge_vfs_trees(existing_tree.clone(), VFSNode::Dir(new_tree));
                     }
-                } else if let VFSNode::File(existing_file) = existing_node {
-                    if let VFSNode::File(new_file) = value {
+                } else if let VFSNode::File(existing_file) = existing_node
+                    && let VFSNode::File(new_file) = value {
                         existing_file.paths.extend(new_file.paths);
                         existing_file.dltx_patches.extend(new_file.dltx_patches);
                     }
-                }
             } else {
                 tree1.insert(key, value);
             }
@@ -1195,7 +1193,7 @@ fn gen_vfs_sort_data_recursive(
                 path: key.clone(),
                 name,
                 down: current_down,
-                extended: extended,
+                extended,
                 file_type: "folder".into(),
                 conflicts: 0,
                 conflicts_active: 0,
@@ -1284,7 +1282,7 @@ fn link_vfs_data_recursive(vfsdata: VFSTree, origin_path: &Path, patchdata: Valu
     for (key, value) in vfsdata {
         let new_path = origin_path.join(&key);
         if let VFSNode::File(file) = value {
-            let source_path = file.paths.iter().last().unwrap().1;
+            let source_path = file.paths.iter().next_back().unwrap().1;
             link_that_file(&PathBuf::from(source_path), &new_path);
         } else if let VFSNode::Dir(children) = value {
             fs::create_dir_all(&new_path).expect("Failed to create directory");
@@ -1307,11 +1305,11 @@ fn save_vfs_changes(mut current_dir: &Path) {
         let path = entry.path();
         if path.is_dir() {
             save_vfs_changes(&path);
-        } else if path.is_file() {
-            if !path.is_dir() {
+        } else if path.is_file()
+            && !path.is_dir() {
                 let metadata = fs::symlink_metadata(&path).expect("Failed to get file metadata");
                 if !metadata.is_symlink() {
-                    let relative_path = pathdiff(&path.to_str().unwrap_or(""), ".vfs");
+                    let relative_path = pathdiff(path.to_str().unwrap_or(""), ".vfs");
                     let saved_path = Path::new(".saved").join(&relative_path);
                     fs::create_dir_all(Path::new(".saved").join(&relative_path).parent().unwrap())
                         .expect("Failed to create .saved directory");
@@ -1320,7 +1318,6 @@ fn save_vfs_changes(mut current_dir: &Path) {
                     link_that_file(&saved_path.canonicalize().unwrap(), &path);
                 }
             }
-        }
     }
 }
 
@@ -1339,7 +1336,7 @@ fn fetch_saved_vfs_changes(mut current_dir: &Path) {
         if path.is_dir() {
             fetch_saved_vfs_changes(&path);
         } else if path.is_file() {
-            let relative_path = pathdiff(&path.to_str().unwrap_or(""), ".saved");
+            let relative_path = pathdiff(path.to_str().unwrap_or(""), ".saved");
             let vfs_path = Path::new(".vfs").join(&relative_path);
             if vfs_path.exists() {
                 fs::remove_file(&vfs_path).expect("Failed to remove existing file in .vfs");
@@ -1390,7 +1387,7 @@ fn sort_organize_data(orderdata: Value, organizesort: OrganizeSort) -> Vec<Organ
         OrganizeSort::NameDesc => organizesortlist.sort_by(|a, b| b.name.cmp(&a.name)),
         OrganizeSort::CategoryAsc => organizesortlist.sort_by(|a, b| a.category.cmp(&b.category)),
         OrganizeSort::CategoryDesc => organizesortlist.sort_by(|a, b| b.category.cmp(&a.category)),
-        OrganizeSort::PriorityAsc => organizesortlist.sort_by(|a, b| a.priority.cmp(&b.priority)),
+        OrganizeSort::PriorityAsc => organizesortlist.sort_by_key(|a| a.priority),
         OrganizeSort::PriorityDesc => organizesortlist.sort_by(|a, b| b.priority.cmp(&a.priority)),
     }
     organizesortlist
@@ -1438,7 +1435,8 @@ fn link_that_file(source: &Path, destination: &Path) {
 }
 
 fn pick_mod_file() -> Option<PathBuf> {
-    let result = DialogBuilder::file()
+    
+    DialogBuilder::file()
         .set_location(&std::env::home_dir().unwrap_or(Path::new(".").to_path_buf()))
         .add_filter("Zip files", ["zip"])
         .add_filter("7z files", ["7z", "7zip"])
@@ -1447,6 +1445,5 @@ fn pick_mod_file() -> Option<PathBuf> {
         .set_title("Select Mod Folder")
         .open_single_file()
         .show()
-        .unwrap();
-    result
+        .unwrap()
 }
