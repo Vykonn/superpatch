@@ -84,9 +84,9 @@ struct VFSSort {
 }
 #[derive(PartialEq, Clone)]
 enum VFSSortType {
-    ShowAll,
-    ShowConflicts,
-    ShowDLTXPatches,
+    All,
+    Conflicts,
+    DLTXPatches,
 }
 type VFSTree = BTreeMap<String, VFSNode>;
 #[derive(Clone)]
@@ -107,11 +107,18 @@ struct LiveData {
     install_modal_open: bool,
     install_modal_path: PathBuf,
     text_input_modal_open: bool,
+    text_input_modal_type: TextInputType,
+    text_input_modal_value: String,
     settingsedit_type: SettingsEditType,
     settingsedit_value: String,
     organizeedit_type: OrganizeSortEditType,
     organizeedit_index: usize,
     organizeedit_value: String,
+}
+
+enum TextInputType {
+    None,
+    RenameFolder,
 }
 
 impl SuperPatchApp {
@@ -135,7 +142,7 @@ impl SuperPatchApp {
             status: "Ready.".to_string(),
             settings,
             vfssort: VFSSort {
-                sort_type: VFSSortType::ShowAll,
+                sort_type: VFSSortType::All,
                 expanded: Vec::new(),
                 query: String::new(),
             },
@@ -149,6 +156,8 @@ impl SuperPatchApp {
                 install_modal_open: false,
                 install_modal_path: PathBuf::new(),
                 text_input_modal_open: false,
+                text_input_modal_type: TextInputType::None,
+                text_input_modal_value: String::new(),
                 settingsedit_type: SettingsEditType::None,
                 settingsedit_value: String::new(),
                 organizeedit_type: OrganizeSortEditType::None,
@@ -156,6 +165,90 @@ impl SuperPatchApp {
                 organizeedit_value: String::new(),
             },
         }
+    }
+    //MARK: Fast Actions
+    fn refresh_all(&mut self) {
+        (self.orderdata,self.vfsdata,self.vfscache,self.organizesort_list,self.vfssort_list,) = refresh_data(self.organizesort.clone(),self.vfssort.clone(),self.patchdata.clone(),);
+    }
+    fn update_all(&mut self) {
+        (self.vfsdata, self.vfscache, self.organizesort_list, self.vfssort_list) = update_data(self.orderdata.clone(), self.organizesort.clone(), self.vfssort.clone(), self.patchdata.clone(), self.vfscache.clone());
+    }
+    fn update_vfs_sort(&mut self) {
+        self.vfssort_list = gen_vfs_sort_data(self.vfsdata.clone(),self.vfssort.clone(),self.patchdata.clone(),);
+    }
+    fn update_order_sort(&mut self) {
+        self.organizesort_list = sort_organize_data(self.orderdata.clone(), self.organizesort.clone());
+    }
+    fn clear_organize_edit(&mut self) {
+        self.livedata.organizeedit_value.clear();
+        self.livedata.organizeedit_type = OrganizeSortEditType::None;
+        self.livedata.organizeedit_index = 0;
+    }
+    fn clear_settings_edit(&mut self) {
+        self.livedata.settingsedit_value.clear();
+        self.livedata.settingsedit_type = SettingsEditType::None;
+        
+    }
+    //MARK: Slow Actions
+    //TODO General: Async Slow Actions
+    fn launch(&mut self) {
+        //Stop launch if the game is already running.
+        let mut system = System::new();
+        system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        let game_running = system
+            .processes_by_name(std::ffi::OsStr::new("Anomaly"))
+            .next()
+            .is_some();
+        if game_running {
+            self.status = "Game is already running. Please close it before launching again.".to_string();
+            return;
+        }
+        //Stop launch if the game path or command is empty.
+        if self.settings["game_path"].as_str().unwrap_or("").is_empty()
+            || self.settings["game_command"]
+                .as_str()
+                .unwrap_or("")
+                .is_empty()
+        {
+            self.status = "Game path or command is empty. Please set them before launching.".to_string();
+            return;
+        }
+        //Save settings if they were changed in the UI
+        let edit_type = &self.livedata.settingsedit_type;
+        match edit_type {
+            SettingsEditType::GamePath => {
+                self.settings["game_path"] =
+                    Value::String(self.livedata.settingsedit_value.clone());
+                save_settings(self.settings.clone());
+                self.livedata.settingsedit_type = SettingsEditType::None;
+            }
+            SettingsEditType::GameCommand => {
+                self.settings["game_command"] =
+                    Value::String(self.livedata.settingsedit_value.clone());
+                save_settings(self.settings.clone());
+                self.livedata.settingsedit_type = SettingsEditType::None;
+            }
+            _ => {}
+        }
+        self.status = "Checking game.".to_string();
+        let mut vfsdata_active = self.vfsdata.clone();
+        let game_path = self.settings["game_path"].as_str().unwrap_or("");
+        let game_vfsdata = vfs_scan(game_path, game_path, VFSTree::new());
+        vfsdata_active = merge_vfs_trees(vfsdata_active, game_vfsdata);
+        self.status = "Moving files.".to_string();
+        save_vfs_changes(Path::new(""));
+        let real_vfs_path = realize_vfs_data(vfsdata_active, self.patchdata.clone());
+        let game_command = self.settings["game_command"]
+            .as_str()
+            .unwrap_or("")
+            .replace("%path%", real_vfs_path.to_str().unwrap_or(""));
+        self.status = "Launching game.".to_string();
+        //TODO Launch: Display error message if the command fails to launch the game.
+        let _ = Command::new("sh")
+            .arg("-c")
+            .arg(game_command)
+            .spawn();
+        self.status = "Launched game.".to_string();
     }
 }
 
@@ -191,7 +284,16 @@ impl eframe::App for SuperPatchApp {
         }
         //TODO Tools: Initial setup modal for first time users.
         //If you on windows, https://neacsu.net/posts/win_symlinks/
-
+        if !self.settings["initialized"].as_bool().unwrap_or(false) {
+            let initial_modal = Modal::new(Id::new("initial_modal")).show(ui.ctx(), |ui| {
+                ui.heading("Initial Setup");
+                ui.label("This feature is not yet implemented.");
+            });
+            if initial_modal.should_close() {
+                self.settings["initialized"] = Value::Bool(true);
+                save_settings(self.settings.clone());
+            }
+        }
         //MARK: Wine Modal
         //TODO Tools: Install / detect wine or proton and set up wineprefix for the game. (Linux only)
         //GET WINE
@@ -265,7 +367,7 @@ impl eframe::App for SuperPatchApp {
             }
         }
         //MARK: Text input modal
-        //TODO General: vague ahh text input modal
+        //TODO General: General purpose text input modal
         if self.livedata.text_input_modal_open {
             let text_input_modal = Modal::new(Id::new("text_input_modal")).show(ui.ctx(), |ui| {
                 ui.heading("Text Input");
@@ -284,23 +386,13 @@ impl eframe::App for SuperPatchApp {
                     }
                     if ui.button("Add mod").clicked() {
                         let path = pick_mod_file();
-                        if path.is_some() {
+                        if let Some(path_full) = path {
                             self.livedata.install_modal_open = true;
-                            self.livedata.install_modal_path = path.unwrap();
+                            self.livedata.install_modal_path = path_full;
                         }
                     }
                     if ui.button("Refresh").clicked() {
-                        (
-                            self.orderdata,
-                            self.vfsdata,
-                            self.vfscache,
-                            self.organizesort_list,
-                            self.vfssort_list,
-                        ) = refresh_data(
-                            self.organizesort.clone(),
-                            self.vfssort.clone(),
-                            self.patchdata.clone(),
-                        );
+                        self.refresh_all()
                     }
                     if ui.button("Save VFS Changes").clicked() {
                         save_vfs_changes(Path::new(""));
@@ -328,66 +420,7 @@ impl eframe::App for SuperPatchApp {
                 ui.heading("Superpatch");
                 ui.label("v0.1.0");
                 if ui.button("Launch").clicked() {
-                    //Stop launch if the game is already running.
-                    let mut system = System::new();
-                    system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-                    let game_running = system
-                        .processes_by_name(std::ffi::OsStr::new("Anomaly"))
-                        .next()
-                        .is_some();
-                    if game_running {
-                        self.status =
-                            "Game is already running. Please close it before launching again."
-                                .to_string();
-                        return;
-                    }
-                    //Stop launch if the game path or command is empty.
-                    if self.settings["game_path"].as_str().unwrap_or("").is_empty()
-                        || self.settings["game_command"]
-                            .as_str()
-                            .unwrap_or("")
-                            .is_empty()
-                    {
-                        self.status =
-                            "Game path or command is empty. Please set them before launching."
-                                .to_string();
-                        return;
-                    }
-                    //Save settings if they were changed in the UI
-                    let edit_type = &self.livedata.settingsedit_type;
-                    match edit_type {
-                        SettingsEditType::GamePath => {
-                            self.settings["game_path"] =
-                                Value::String(self.livedata.settingsedit_value.clone());
-                            save_settings(self.settings.clone());
-                            self.livedata.settingsedit_type = SettingsEditType::None;
-                        }
-                        SettingsEditType::GameCommand => {
-                            self.settings["game_command"] =
-                                Value::String(self.livedata.settingsedit_value.clone());
-                            save_settings(self.settings.clone());
-                            self.livedata.settingsedit_type = SettingsEditType::None;
-                        }
-                        _ => {}
-                    }
-                    //TODO Launch: Add progress bar
-                    let mut vfsdata_active = self.vfsdata.clone();
-                    let game_path = self.settings["game_path"].as_str().unwrap_or("");
-                    let game_vfsdata = vfs_scan(game_path, game_path, VFSTree::new());
-                    vfsdata_active = merge_vfs_trees(vfsdata_active, game_vfsdata);
-                    save_vfs_changes(Path::new(""));
-                    let real_vfs_path = realize_vfs_data(vfsdata_active, self.patchdata.clone());
-                    let game_command = self.settings["game_command"]
-                        .as_str()
-                        .unwrap_or("")
-                        .replace("%path%", real_vfs_path.to_str().unwrap_or(""));
-                    println!("Launching game with command: {}", game_command);
-                    //TODO Launch: Display error message if the command fails to launch the game.
-                    let _ = Command::new("sh")
-                        .arg("-c")
-                        .arg(game_command)
-                        .spawn();
-                    self.status = "Launched game.".to_string();
+                    self.launch();
                 }
 
                 ui.label("Game Path:");
@@ -395,10 +428,7 @@ impl eframe::App for SuperPatchApp {
                     if self.livedata.settingsedit_type == SettingsEditType::GamePath {
                         self.livedata.settingsedit_value.clone()
                     } else {
-                        self.settings["game_path"]
-                            .as_str()
-                            .unwrap_or("")
-                            .to_string()
+                        self.settings["game_path"].as_str().unwrap_or("").to_string()
                     };
                 let response = ui.text_edit_multiline(&mut game_path_setting);
                 if response.changed() {
@@ -408,7 +438,7 @@ impl eframe::App for SuperPatchApp {
                 if response.lost_focus() {
                     self.settings["game_path"] = Value::String(game_path_setting.to_string());
                     save_settings(self.settings.clone());
-                    self.livedata.settingsedit_type = SettingsEditType::None;
+                    self.clear_settings_edit();
                 }
 
                 ui.label("Game Command:");
@@ -416,10 +446,7 @@ impl eframe::App for SuperPatchApp {
                     if self.livedata.settingsedit_type == SettingsEditType::GameCommand {
                         self.livedata.settingsedit_value.clone()
                     } else {
-                        self.settings["game_command"]
-                            .as_str()
-                            .unwrap_or("")
-                            .to_string()
+                        self.settings["game_command"].as_str().unwrap_or("").to_string()
                     };
                 let response = ui.text_edit_multiline(&mut game_command_setting);
                 if response.changed() {
@@ -429,7 +456,7 @@ impl eframe::App for SuperPatchApp {
                 if response.lost_focus() {
                     self.settings["game_command"] = Value::String(game_command_setting.to_string());
                     save_settings(self.settings.clone());
-                    self.livedata.settingsedit_type = SettingsEditType::None;
+                    self.clear_settings_edit();
                 }
             });
         });
@@ -440,61 +467,31 @@ impl eframe::App for SuperPatchApp {
                 match self.selected_tab {
                     Tab::Organize => {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |_ui| {
-                            //TODO General: Search bar for organize Tab
+                            //TODO General: Search bar for Organize Tab
                         });
                     }
                     Tab::Files => {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            //TODO General: Search bar for files Tab
+                            //TODO General: Search bar for Files Tab
                             let sort_text = match self.vfssort.sort_type {
-                                VFSSortType::ShowAll => "Show All",
-                                VFSSortType::ShowConflicts => "Show Conflicts",
-                                VFSSortType::ShowDLTXPatches => "Show DLTX Patches",
+                                VFSSortType::All => "Show All",
+                                VFSSortType::Conflicts => "Show Conflicts",
+                                VFSSortType::DLTXPatches => "Show DLTX Patches",
                             };
                             egui::ComboBox::from_label("Filter")
                                 .selected_text(sort_text)
                                 .show_ui(ui, |ui| {
-                                    if ui
-                                        .selectable_label(
-                                            self.vfssort.sort_type == VFSSortType::ShowAll,
-                                            "Show All",
-                                        )
-                                        .clicked()
-                                    {
-                                        self.vfssort.sort_type = VFSSortType::ShowAll;
-                                        self.vfssort_list = gen_vfs_sort_data(
-                                            self.vfsdata.clone(),
-                                            self.vfssort.clone(),
-                                            self.patchdata.clone(),
-                                        );
+                                    if ui.selectable_label(self.vfssort.sort_type == VFSSortType::All,"Show All").clicked() {
+                                        self.vfssort.sort_type = VFSSortType::All;
+                                        self.update_vfs_sort();
                                     }
-                                    if ui
-                                        .selectable_label(
-                                            self.vfssort.sort_type == VFSSortType::ShowConflicts,
-                                            "Show Conflicts",
-                                        )
-                                        .clicked()
-                                    {
-                                        self.vfssort.sort_type = VFSSortType::ShowConflicts;
-                                        self.vfssort_list = gen_vfs_sort_data(
-                                            self.vfsdata.clone(),
-                                            self.vfssort.clone(),
-                                            self.patchdata.clone(),
-                                        );
+                                    if ui.selectable_label(self.vfssort.sort_type == VFSSortType::Conflicts, "Show Conflicts").clicked() {
+                                        self.vfssort.sort_type = VFSSortType::Conflicts;
+                                        self.update_vfs_sort();
                                     }
-                                    if ui
-                                        .selectable_label(
-                                            self.vfssort.sort_type == VFSSortType::ShowDLTXPatches,
-                                            "Show DLTX Patches",
-                                        )
-                                        .clicked()
-                                    {
-                                        self.vfssort.sort_type = VFSSortType::ShowDLTXPatches;
-                                        self.vfssort_list = gen_vfs_sort_data(
-                                            self.vfsdata.clone(),
-                                            self.vfssort.clone(),
-                                            self.patchdata.clone(),
-                                        );
+                                    if ui.selectable_label(self.vfssort.sort_type == VFSSortType::DLTXPatches, "Show DLTX Patches").clicked() {
+                                        self.vfssort.sort_type = VFSSortType::DLTXPatches;
+                                        self.update_vfs_sort();
                                     }
                                 });
                         });
@@ -520,7 +517,9 @@ impl eframe::App for SuperPatchApp {
             match self.selected_tab {
                 //MARK: Configuration Page
                 Tab::Organize => {
-                    //TODO General: fix table overflow or underfill
+                    //TODO General: Fix table sizing issues
+                    //Underfill: Calculate new size upon window resizing relative to previous size.
+                    //Overflow: ???
                     let original_widths = self.settings["organize_widths"].as_array().cloned().unwrap_or_else(|| vec![Value::from(50.0), Value::from(200.0), Value::from(100.0), Value::from(100.0), Value::from(100.0)]);
                     TableBuilder::new(ui)
                     .sense(egui::Sense::click_and_drag())
@@ -549,7 +548,7 @@ impl eframe::App for SuperPatchApp {
                                             OrganizeSort::NameDesc => OrganizeSort::NameAsc,
                                             _ => OrganizeSort::NameAsc,
                                         };
-                                        self.organizesort_list = sort_organize_data(self.orderdata.clone(), self.organizesort.clone());
+                                        self.update_order_sort();
                                     }
                                 });
                             });
@@ -569,7 +568,7 @@ impl eframe::App for SuperPatchApp {
                                             OrganizeSort::CategoryDesc => OrganizeSort::CategoryAsc,
                                             _ => OrganizeSort::CategoryAsc,
                                         };
-                                        self.organizesort_list = sort_organize_data(self.orderdata.clone(), self.organizesort.clone());
+                                        self.update_order_sort();
                                     }
                                 });
                             });
@@ -590,7 +589,7 @@ impl eframe::App for SuperPatchApp {
                                             OrganizeSort::PriorityDesc => OrganizeSort::PriorityAsc,
                                             _ => OrganizeSort::PriorityAsc,
                                         };
-                                        self.organizesort_list = sort_organize_data(self.orderdata.clone(), self.organizesort.clone());
+                                        self.update_order_sort();
                                     }
                                 });
                             });
@@ -618,85 +617,38 @@ impl eframe::App for SuperPatchApp {
                             row.col(|ui| {
                                 ui.checkbox(&mut enabled, "").changed().then(|| {
                                     self.orderdata[priority as usize]["enabled"] = Value::Bool(enabled);
-                                    (self.vfsdata, self.vfscache, self.organizesort_list, self.vfssort_list) = update_data(self.orderdata.clone(), self.organizesort.clone(), self.vfssort.clone(), self.patchdata.clone(), self.vfscache.clone());
+                                    self.update_all();
                                     self.status = if enabled { "Enabled mod.".to_string() } else { "Disabled mod.".to_string() };
                                 });
                             });
-                            row.col(|ui| {
-                                if self.livedata.organizeedit_type == OrganizeSortEditType::Name
-                                && self.livedata.organizeedit_index == priority as usize
-                                {
-                                    let mut value = self.livedata.organizeedit_value.clone();
-                                    let response = ui.add(egui::TextEdit::singleline(&mut value));
-                                    if response.lost_focus() {
-                                        self.orderdata[priority as usize]["name"] = Value::String(value.clone());
-                                        (self.vfsdata, self.vfscache, self.organizesort_list, self.vfssort_list) = update_data(self.orderdata.clone(), self.organizesort.clone(), self.vfssort.clone(), self.patchdata.clone(), self.vfscache.clone());
-                                        self.livedata.organizeedit_value.clear();
-                                        self.livedata.organizeedit_type = OrganizeSortEditType::None;
-                                        self.livedata.organizeedit_index = 0;
-                                    }
-                                    if response.changed() {
-                                        self.livedata.organizeedit_value = value;
-                                    }
-                                    response.request_focus();
-                                }
-                                else {
-                                    let response = ui.add(egui::Label::new(name).sense(egui::Sense::click()));
-                                    if response.double_clicked() {
-                                        self.livedata.organizeedit_type = OrganizeSortEditType::Name;
-                                        self.livedata.organizeedit_index = priority as usize;
-                                        self.livedata.organizeedit_value = name.to_string();
-                                    }
-                                }
-                            });
-                            row.col(|ui| {
-                                if self.livedata.organizeedit_type == OrganizeSortEditType::Category
+                            for i in [("name", name, OrganizeSortEditType::Name), ("category", category, OrganizeSortEditType::Category), ("version", version, OrganizeSortEditType::Version)] {
+                                row.col(|ui| {
+                                    if self.livedata.organizeedit_type == i.2
                                     && self.livedata.organizeedit_index == priority as usize
-                                {
-                                    let mut value = self.livedata.organizeedit_value.clone();
-                                    let response = ui.add(egui::TextEdit::singleline(&mut value));
-                                    if response.lost_focus() {
-                                        self.orderdata[priority as usize]["category"] = Value::String(value.clone());
-                                        (self.vfsdata, self.vfscache, self.organizesort_list, self.vfssort_list) = update_data(self.orderdata.clone(), self.organizesort.clone(), self.vfssort.clone(), self.patchdata.clone(), self.vfscache.clone());
-                                        self.livedata.organizeedit_value.clear();
-                                        self.livedata.organizeedit_type = OrganizeSortEditType::None;
-                                        self.livedata.organizeedit_index = 0;
+                                    {
+                                        let mut value = self.livedata.organizeedit_value.clone();
+                                        let response = ui.add(egui::TextEdit::singleline(&mut value));
+                                        if response.lost_focus() {
+                                            self.orderdata[priority as usize][i.0] = Value::String(value.clone());
+                                            self.update_all();
+                                            self.clear_organize_edit();
+                                        }
+                                        if response.changed() {
+                                            self.livedata.organizeedit_value = value;
+                                        }
+                                        response.request_focus();
                                     }
-                                    response.request_focus();
-                                }
-                                else {
-                                    let response = ui.add(egui::Label::new(category).sense(egui::Sense::click()));
-                                    if response.double_clicked() {
-                                        self.livedata.organizeedit_type = OrganizeSortEditType::Category;
-                                        self.livedata.organizeedit_index = priority as usize;
-                                        self.livedata.organizeedit_value = category.to_string();
+                                    else {
+                                        let response = ui.add(egui::Label::new(i.1).sense(egui::Sense::click()));
+                                        if response.double_clicked() {
+                                            self.livedata.organizeedit_type = i.2;
+                                            self.livedata.organizeedit_index = priority as usize;
+                                            self.livedata.organizeedit_value = i.1.to_string();
+                                            
+                                        }
                                     }
-                                }
-                            });
-                            row.col(|ui| {
-                                if self.livedata.organizeedit_type == OrganizeSortEditType::Version
-                                    && self.livedata.organizeedit_index == priority as usize
-                                {
-                                    let mut value = self.livedata.organizeedit_value.clone();
-                                    let response = ui.add(egui::TextEdit::singleline(&mut value));
-                                    if response.lost_focus() {
-                                        self.orderdata[priority as usize]["version"] = Value::String(value.clone());
-                                        (self.vfsdata, self.vfscache, self.organizesort_list, self.vfssort_list) = update_data(self.orderdata.clone(), self.organizesort.clone(), self.vfssort.clone(), self.patchdata.clone(), self.vfscache.clone());
-                                        self.livedata.organizeedit_value.clear();
-                                        self.livedata.organizeedit_type = OrganizeSortEditType::None;
-                                        self.livedata.organizeedit_index = 0;
-                                    }
-                                    response.request_focus();
-                                }
-                                else {
-                                    let response = ui.add(egui::Label::new(version).sense(egui::Sense::click()));
-                                    if response.double_clicked() {
-                                        self.livedata.organizeedit_type = OrganizeSortEditType::Version;
-                                        self.livedata.organizeedit_index = priority as usize;
-                                        self.livedata.organizeedit_value = version.to_string();
-                                    }
-                                }
-                            });
+                                });
+                            }
                             row.col(|ui| {
                                 ui.label(priority.to_string());
                             });
@@ -738,14 +690,14 @@ impl eframe::App for SuperPatchApp {
                                         };
                                         new_orderdata.insert(insert_index, dragged_item);
                                         self.orderdata = Value::Array(new_orderdata);
-                                        (self.vfsdata, self.vfscache, self.organizesort_list, self.vfssort_list) = update_data(self.orderdata.clone(), self.organizesort.clone(), self.vfssort.clone(), self.patchdata.clone(), self.vfscache.clone());
+                                        self.update_all();
                                     }
                                 }
                             }
                             response.context_menu(|ui| {
                                 if ui.button(if enabled { "Disable" } else { "Enable" }).clicked() {
                                     self.orderdata[priority as usize]["enabled"] = Value::Bool(!enabled);
-                                    (self.vfsdata, self.vfscache, self.organizesort_list, self.vfssort_list) = update_data(self.orderdata.clone(), self.organizesort.clone(), self.vfssort.clone(), self.patchdata.clone(), self.vfscache.clone());
+                                    self.update_all();
                                     self.status = if enabled { "Disabled mod.".to_string() } else { "Enabled mod.".to_string() };
                                     ui.close();
                                 }
@@ -775,9 +727,8 @@ impl eframe::App for SuperPatchApp {
                                         fs::remove_dir_all(mod_entry.path.as_str()).expect("Failed to delete mod directory");
                                     }
                                     self.orderdata.as_array_mut().unwrap().remove(priority as usize);
-                                    (self.vfsdata, self.vfscache, self.organizesort_list, self.vfssort_list) = update_data(self.orderdata.clone(), self.organizesort.clone(), self.vfssort.clone(), self.patchdata.clone(), self.vfscache.clone());
+                                    self.update_all();
                                     self.status = "Deleted mod.".to_string();
-                                    ui.close();
                                 }
                                 if ui.button("Reinstall mod").clicked() {  
                                     //TODO Mods: Reinstall mod (Store in order.json and re-run installation)
@@ -789,6 +740,7 @@ impl eframe::App for SuperPatchApp {
                                 if ui.button("Rename mod folder").clicked() {
                                     //TODO Mods: Rename mod folder (update order.json)
                                     //Need text input
+                                    self.livedata.text_input_modal_open = true;
                                     //TODO Patch: Update patch.json with new path
                                 }
                                 if ui.button("Open mod folder").clicked() {
@@ -827,7 +779,7 @@ impl eframe::App for SuperPatchApp {
                         self.vfssort_list_refresh_requested = false;
                     }
                     let original_widths = self.settings["files_widths"].as_array().cloned().unwrap_or_else(|| vec![Value::from(200.0), Value::from(100.0), Value::from(100.0)]);
-                    //TODO General: fix table overflow or underfill
+                    //TODO General: Fix table sizing issues (See above.)
                     TableBuilder::new(ui)
                     .sense(egui::Sense::click())
                     .striped(true)
@@ -921,7 +873,7 @@ fn main() {
     let vfssort_list = gen_vfs_sort_data(
         vfsdata.clone(),
         VFSSort {
-            sort_type: VFSSortType::ShowAll,
+            sort_type: VFSSortType::All,
             expanded: Vec::new(),
             query: String::new(),
         },
@@ -1220,13 +1172,13 @@ fn vfs_sort_data_prune_files(vfssortlist: &mut Vec<VFSSortListEntry>, vfssort: V
         if entry.file_type != "folder" {
             let mut remove = false;
             match vfssort.sort_type {
-                VFSSortType::ShowAll => {}
-                VFSSortType::ShowConflicts => {
+                VFSSortType::All => {}
+                VFSSortType::Conflicts => {
                     if entry.conflicts == 0 {
                         remove = true;
                     }
                 }
-                VFSSortType::ShowDLTXPatches => {
+                VFSSortType::DLTXPatches => {
                     if entry.dltx_patches == 0 {
                         remove = true;
                     }
@@ -1251,8 +1203,8 @@ fn vfs_sort_data_prune_folders(vfssortlist: &mut Vec<VFSSortListEntry>, vfssort:
             .any(|child_entry| is_descendant_path(&child_entry.path, &entry.path));
 
         let remove_folder = match vfssort.sort_type {
-            VFSSortType::ShowAll => false,
-            VFSSortType::ShowConflicts | VFSSortType::ShowDLTXPatches => !has_children,
+            VFSSortType::All => false,
+            VFSSortType::Conflicts | VFSSortType::DLTXPatches => !has_children,
         };
 
         if remove_folder {
@@ -1388,7 +1340,7 @@ fn sort_organize_data(orderdata: Value, organizesort: OrganizeSort) -> Vec<Organ
         OrganizeSort::CategoryAsc => organizesortlist.sort_by(|a, b| a.category.cmp(&b.category)),
         OrganizeSort::CategoryDesc => organizesortlist.sort_by(|a, b| b.category.cmp(&a.category)),
         OrganizeSort::PriorityAsc => organizesortlist.sort_by_key(|a| a.priority),
-        OrganizeSort::PriorityDesc => organizesortlist.sort_by(|a, b| b.priority.cmp(&a.priority)),
+        OrganizeSort::PriorityDesc => organizesortlist.sort_by_key(|b| std::cmp::Reverse(b.priority)),
     }
     organizesortlist
 }
