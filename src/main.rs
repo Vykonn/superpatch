@@ -2,8 +2,11 @@ use eframe::egui::{self, Id, Modal};
 use egui_extras::{Column, TableBuilder};
 use native_dialog::DialogBuilder;
 use ordered_hash_map::OrderedHashMap;
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
+use rayon::slice::ParallelSliceMut;
 use serde_json::Value;
-use std::fs;
+use std::sync::{Arc, Mutex};
+use std::{fs, thread};
 use std::path::Path;
 use std::{
     collections::{BTreeMap, HashMap},
@@ -19,7 +22,7 @@ struct SuperPatchApp {
     vfscache: HashMap<String, VFSNode>,
     organizesort: OrganizeSort,
     organizesort_list: Vec<OrganizeSortListEntry>,
-    status: String,
+    status: Arc<Mutex<String>>,
     settings: Value,
     vfssort: VFSSort,
     vfssort_list: Vec<VFSSortListEntry>,
@@ -99,7 +102,7 @@ struct VFSFile {
     paths: OrderedHashMap<String, String>,
     dltx_patches: HashMap<String, String>,
 }
-
+#[derive(Clone)]
 struct LiveData {
     wine_modal_open: bool,
     modded_exes_modal_open: bool,
@@ -115,7 +118,7 @@ struct LiveData {
     organizeedit_index: usize,
     organizeedit_value: String,
 }
-
+#[derive(Clone)]
 enum TextInputType {
     None,
     RenameFolder,
@@ -139,7 +142,7 @@ impl SuperPatchApp {
             vfscache,
             organizesort: OrganizeSort::PriorityAsc,
             organizesort_list,
-            status: "Ready.".to_string(),
+            status: Arc::new(Mutex::new("Ready".to_string())),
             settings,
             vfssort: VFSSort {
                 sort_type: VFSSortType::All,
@@ -189,30 +192,8 @@ impl SuperPatchApp {
         self.livedata.settingsedit_type = SettingsEditType::None;
         
     }
-    //MARK: Slow Actions
-    //TODO General: Async Slow Actions
+    //MARK: Slow Actions (Threaded)
     fn launch(&mut self) {
-        //Stop launch if the game is already running.
-        let mut system = System::new();
-        system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
-        let game_running = system
-            .processes_by_name(std::ffi::OsStr::new("Anomaly"))
-            .next()
-            .is_some();
-        if game_running {
-            self.status = "Game is already running. Please close it before launching again.".to_string();
-            return;
-        }
-        //Stop launch if the game path or command is empty.
-        if self.settings["game_path"].as_str().unwrap_or("").is_empty()
-            || self.settings["game_command"]
-                .as_str()
-                .unwrap_or("")
-                .is_empty()
-        {
-            self.status = "Game path or command is empty. Please set them before launching.".to_string();
-            return;
-        }
         //Save settings if they were changed in the UI
         let edit_type = &self.livedata.settingsedit_type;
         match edit_type {
@@ -230,25 +211,53 @@ impl SuperPatchApp {
             }
             _ => {}
         }
-        self.status = "Checking game.".to_string();
-        let mut vfsdata_active = self.vfsdata.clone();
-        let game_path = self.settings["game_path"].as_str().unwrap_or("");
+        let settings = self.settings.clone();
+        let vfsdata = self.vfsdata.clone();
+        let patchdata = self.patchdata.clone();
+        let livedata = self.livedata.clone();
+        let status = Arc::clone(&self.status);
+        thread::spawn(move || {
+        //Stop launch if the game is already running.
+        let mut system = System::new();
+        system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+        let game_running = system
+            .processes_by_name(std::ffi::OsStr::new("Anomaly"))
+            .next()
+            .is_some();
+        if game_running {
+            *status.lock().unwrap() = "Game is already running. Please close it before launching again.".to_string();
+            return;
+        }
+        //Stop launch if the game path or command is empty.
+        if settings["game_path"].as_str().unwrap_or("").is_empty()
+            || settings["game_command"]
+                .as_str()
+                .unwrap_or("")
+                .is_empty()
+        {
+            *status.lock().unwrap() = "Game path or command is empty. Please set them before launching.".to_string();
+            return;
+        }
+        *status.lock().unwrap() = "Checking game.".to_string();
+        let mut vfsdata_active = vfsdata.clone();
+        let game_path = settings["game_path"].as_str().unwrap_or("");
         let game_vfsdata = vfs_scan(game_path, game_path, VFSTree::new());
         vfsdata_active = merge_vfs_trees(vfsdata_active, game_vfsdata);
-        self.status = "Moving files.".to_string();
+        *status.lock().unwrap() = "Moving files.".to_string();
         save_vfs_changes(Path::new(""));
-        let real_vfs_path = realize_vfs_data(vfsdata_active, self.patchdata.clone());
-        let game_command = self.settings["game_command"]
+        let real_vfs_path = realize_vfs_data(vfsdata_active, patchdata.clone());
+        let game_command = settings["game_command"]
             .as_str()
             .unwrap_or("")
             .replace("%path%", real_vfs_path.to_str().unwrap_or(""));
-        self.status = "Launching game.".to_string();
+        *status.lock().unwrap() = "Launching game.".to_string();
         //TODO Launch: Display error message if the command fails to launch the game.
         let _ = Command::new("sh")
             .arg("-c")
             .arg(game_command)
             .spawn();
-        self.status = "Launched game.".to_string();
+        *status.lock().unwrap() = "Launched game.".to_string();
+        });
     }
 }
 
@@ -463,7 +472,7 @@ impl eframe::App for SuperPatchApp {
         //MARK: Bottom Panel
         egui::Panel::bottom("bottom_panel").show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(self.status.clone());
+                ui.label(self.status.clone().lock().unwrap().as_str());
                 match self.selected_tab {
                     Tab::Organize => {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |_ui| {
@@ -602,8 +611,8 @@ impl eframe::App for SuperPatchApp {
                         let ui_clone = body.ui_mut().ctx().clone();
                         let painter_clone = body.ui_mut().painter().clone();
                         let current_widths = body.widths();
-                        if current_widths != original_widths.iter().map(|v| v.as_f64().unwrap_or(0.0) as f32).collect::<Vec<f32>>() {
-                            self.settings["organize_widths"] = Value::Array(current_widths.iter().map(|&w| Value::from(w as f64)).collect());
+                        if current_widths != original_widths.par_iter().map(|v| v.as_f64().unwrap_or(0.0) as f32).collect::<Vec<f32>>() {
+                            self.settings["organize_widths"] = Value::Array(current_widths.par_iter().map(|&w| Value::from(w as f64)).collect());
                             save_settings(self.settings.clone());
                         }
                         body.rows(row_height, num_rows, |mut row | {
@@ -618,7 +627,7 @@ impl eframe::App for SuperPatchApp {
                                 ui.checkbox(&mut enabled, "").changed().then(|| {
                                     self.orderdata[priority as usize]["enabled"] = Value::Bool(enabled);
                                     self.update_all();
-                                    self.status = if enabled { "Enabled mod.".to_string() } else { "Disabled mod.".to_string() };
+                                    *self.status.lock().unwrap() = if enabled { "Enabled mod.".to_string() } else { "Disabled mod.".to_string() };
                                 });
                             });
                             for i in [("name", name, OrganizeSortEditType::Name), ("category", category, OrganizeSortEditType::Category), ("version", version, OrganizeSortEditType::Version)] {
@@ -658,7 +667,7 @@ impl eframe::App for SuperPatchApp {
                                 response.dnd_set_drag_payload(priority);
                             } else {
                                 if response.drag_started() {
-                                    self.status = "Drag and Drop is only available when sorting by Priority.".to_string();
+                                    *self.status.lock().unwrap() = "Drag and Drop is only available when sorting by Priority.".to_string();
                                 }
                             }
                             if let (Some(pointer), Some(_hovered_payload)) = (
@@ -698,12 +707,12 @@ impl eframe::App for SuperPatchApp {
                                 if ui.button(if enabled { "Disable" } else { "Enable" }).clicked() {
                                     self.orderdata[priority as usize]["enabled"] = Value::Bool(!enabled);
                                     self.update_all();
-                                    self.status = if enabled { "Disabled mod.".to_string() } else { "Enabled mod.".to_string() };
+                                    *self.status.lock().unwrap() = if enabled { "Disabled mod.".to_string() } else { "Enabled mod.".to_string() };
                                     ui.close();
                                 }
                                 if ui.button("Copy name").clicked() {
                                     ui.ctx().copy_text(name.to_owned());
-                                    self.status = "Copied mod name to clipboard.".to_string();
+                                    *self.status.lock().unwrap() = "Copied mod name to clipboard.".to_string();
                                     ui.close();
                                 }
                                 if ui.button("Rename mod").clicked() {
@@ -728,7 +737,7 @@ impl eframe::App for SuperPatchApp {
                                     }
                                     self.orderdata.as_array_mut().unwrap().remove(priority as usize);
                                     self.update_all();
-                                    self.status = "Deleted mod.".to_string();
+                                    *self.status.lock().unwrap() = "Deleted mod.".to_string();
                                 }
                                 if ui.button("Reinstall mod").clicked() {  
                                     //TODO Mods: Reinstall mod (Store in order.json and re-run installation)
@@ -747,10 +756,10 @@ impl eframe::App for SuperPatchApp {
                                     let mod_path = mod_entry.path.as_str();
                                     if !mod_path.is_empty() {
                                         if let Err(e) = open::that(mod_path) {
-                                            self.status = format!("Failed to open mod folder: {}", e);
+                                            *self.status.lock().unwrap() = format!("Failed to open mod folder: {}", e);
                                         }
                                     } else {
-                                        self.status = "Mod path is empty.".to_string();
+                                        *self.status.lock().unwrap() = "Mod path is empty.".to_string();
                                     }
                                     ui.close();
                                 }
@@ -798,8 +807,8 @@ impl eframe::App for SuperPatchApp {
                         let row_height = 20.0;
                         let num_rows = self.vfssort_list.len();
                         let current_widths = body.widths();
-                        if current_widths != original_widths.iter().map(|v| v.as_f64().unwrap_or(0.0) as f32).collect::<Vec<f32>>() {
-                            self.settings["files_widths"] = Value::Array(current_widths.iter().map(|&w| Value::from(w as f64)).collect());
+                        if current_widths != original_widths.par_iter().map(|v| v.as_f64().unwrap_or(0.0) as f32).collect::<Vec<f32>>() {
+                            self.settings["files_widths"] = Value::Array(current_widths.par_iter().map(|&w| Value::from(w as f64)).collect());
                             save_settings(self.settings.clone());
                         }
                         body.rows(row_height, num_rows, |mut row | {
@@ -1022,7 +1031,7 @@ fn gen_vfs_data(
             !orderdata
                 .as_array()
                 .unwrap()
-                .iter()
+                .par_iter()
                 .any(|entry| entry["name"].as_str().unwrap_or("") == key.as_str())
         })
         .cloned()
@@ -1199,7 +1208,7 @@ fn vfs_sort_data_prune_folders(vfssortlist: &mut Vec<VFSSortListEntry>, vfssort:
         }
 
         let has_children = vfssortlist
-            .iter()
+            .par_iter()
             .any(|child_entry| is_descendant_path(&child_entry.path, &entry.path));
 
         let remove_folder = match vfssort.sort_type {
@@ -1335,12 +1344,12 @@ fn sort_organize_data(orderdata: Value, organizesort: OrganizeSort) -> Vec<Organ
         });
     }
     match organizesort {
-        OrganizeSort::NameAsc => organizesortlist.sort_by(|a, b| a.name.cmp(&b.name)),
-        OrganizeSort::NameDesc => organizesortlist.sort_by(|a, b| b.name.cmp(&a.name)),
-        OrganizeSort::CategoryAsc => organizesortlist.sort_by(|a, b| a.category.cmp(&b.category)),
-        OrganizeSort::CategoryDesc => organizesortlist.sort_by(|a, b| b.category.cmp(&a.category)),
-        OrganizeSort::PriorityAsc => organizesortlist.sort_by_key(|a| a.priority),
-        OrganizeSort::PriorityDesc => organizesortlist.sort_by_key(|b| std::cmp::Reverse(b.priority)),
+        OrganizeSort::NameAsc => organizesortlist.par_sort_by(|a, b| a.name.cmp(&b.name)),
+        OrganizeSort::NameDesc => organizesortlist.par_sort_by(|a, b| b.name.cmp(&a.name)),
+        OrganizeSort::CategoryAsc => organizesortlist.par_sort_by(|a, b| a.category.cmp(&b.category)),
+        OrganizeSort::CategoryDesc => organizesortlist.par_sort_by(|a, b| b.category.cmp(&a.category)),
+        OrganizeSort::PriorityAsc => organizesortlist.par_sort_by_key(|a| a.priority),
+        OrganizeSort::PriorityDesc => organizesortlist.par_sort_by_key(|b| std::cmp::Reverse(b.priority)),
     }
     organizesortlist
 }
