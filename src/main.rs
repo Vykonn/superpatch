@@ -7,6 +7,7 @@ use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use rayon::slice::ParallelSliceMut;
 use regex::Regex;
 use serde_json::{Value, json};
+use sevenz_rust2::{Archive, ArchiveEntry, Password, decompress_with_extract_fn};
 use zip::ZipArchive;
 use std::ffi::OsStr;
 use std::io::{self, Read, Seek};
@@ -313,18 +314,18 @@ impl SuperPatchApp {
             self.livedata.install_modal_type = InstallModalType::None;
             return
         };
-        //TODO Mods: Allow rar and 7z
+        let mut file = std::fs::File::open(&self.livedata.install_modal_path).unwrap();
         self.livedata.install_modal_vfs_data = match extension_type {
             "zip" => {
-                let file = std::fs::File::open(&self.livedata.install_modal_path).unwrap();
+
                 let mut archive = zip::ZipArchive::new(file).unwrap();
                 Some(vfs_scan_zip(&mut archive, self.livedata.install_modal_path.to_str().unwrap()).unwrap())
             },
             "rar" => {
-                todo!()
+                Some(vfs_scan_rar(&self.livedata.install_modal_path, self.livedata.install_modal_path.to_str().unwrap()))
             },
             "7z" => {
-                todo!()
+                Some(vfs_scan_7z(&mut file, self.livedata.install_modal_path.to_str().unwrap()).unwrap())
             },
             _ => panic!()
         };
@@ -360,19 +361,23 @@ impl SuperPatchApp {
             fs::create_dir("mods").expect("Failed to create configs directory")
         }
         let target_path = Path::new("mods").join(install_data.name.clone());
+        let file = std::fs::File::open(&self.livedata.install_modal_path).unwrap();
         match extension_type {
             "zip" => {
-                let file = std::fs::File::open(&self.livedata.install_modal_path).unwrap();
                 let mut archive = zip::ZipArchive::new(file).unwrap();
                 for directory in &install_data.selected_paths {
                     extract_dir_from_zip(&mut archive, directory, &target_path).expect("Failed to extract directory from zip");
                 }
             },
             "rar" => {
-                todo!()
+                for directory in &install_data.selected_paths {
+                    extract_dir_from_rar(&self.livedata.install_modal_path, directory, &target_path).expect("Failed to extract directory from rar");
+                }
             },
             "7z" => {
-                todo!()
+                for directory in &install_data.selected_paths {
+                    extract_dir_from_7z(file.try_clone().unwrap(), directory, &target_path).expect("Failed to extract directory from 7z");
+                }
             },
             _ => panic!()
         }
@@ -1074,6 +1079,12 @@ impl eframe::App for SuperPatchApp {
                                     if mod_entry.path.as_str() != "" {
                                         fs::remove_dir_all(mod_entry.path.as_str()).expect("Failed to delete mod directory");
                                     }
+                                    let archive = self.orderdata.get(priority as usize).unwrap().get("archive").unwrap();
+                                    if let Value::String(string) = archive
+                                        && !string.is_empty() {
+                                            let archive_path = Path::new("archives").join(string); 
+                                            fs::remove_file(archive_path).expect("Archive could not be deleted.");
+                                        }
                                     self.orderdata.as_array_mut().unwrap().remove(priority as usize);
                                     self.update_all();
                                     *self.status.lock().unwrap() = "Deleted mod.".to_string();
@@ -1767,6 +1778,126 @@ fn extract_dir_from_zip(
             if let Some(mode) = file.unix_mode() {
                 fs::set_permissions(&out_path, fs::Permissions::from_mode(mode))?;
             }
+        }
+    }
+    Ok(())
+}
+
+//MARK: VFS Scan 7Z
+//SLOP
+fn vfs_scan_7z<R: Read + Seek>(
+    reader: &mut R,
+    origin_path: &str,
+) -> Result<VFSNode, sevenz_rust2::Error> {
+    let archive = Archive::read(reader, &Password::empty())?;
+
+    let mut tree: VFSTree = VFSTree::new();
+    for entry in &archive.files {
+        let name = entry.name.replace('\\', "/");
+        let path = std::path::Path::new(&name);
+        insert_zip_entry(&mut tree, path, origin_path, entry.is_directory);
+    }
+
+    Ok(VFSNode::Dir(tree))
+}
+
+//MARK: 7Z Extraction
+//SLOP
+fn extract_dir_from_7z(
+    reader: impl Read + std::io::Seek,
+    dir_prefix: &str,
+    output_root: &Path,
+) -> Result<(), sevenz_rust2::Error> {
+    let prefix = if dir_prefix.is_empty() {
+        String::new()
+    } else if dir_prefix.ends_with('/') {
+        dir_prefix.to_string()
+    } else {
+        format!("{}/", dir_prefix)
+    };
+
+    decompress_with_extract_fn(reader, output_root, |entry: &ArchiveEntry, entry_reader: &mut dyn Read, _dest_path: &PathBuf| {
+        let name = entry.name.replace('\\', "/");
+
+        if !prefix.is_empty() && (!name.starts_with(&prefix) || name.len() == prefix.len()) {
+            return Ok(false); // not under target dir, or is the dir entry itself
+        }
+
+        let relative = if prefix.is_empty() { name.as_str() } else { &name[prefix.len()..] };
+        let out_path = output_root.join(relative);
+
+        if entry.is_directory {
+            fs::create_dir_all(&out_path)?;
+        } else {
+            if let Some(parent) = out_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut out_file = fs::File::create(&out_path)?;
+            io::copy(entry_reader, &mut out_file)?;
+        }
+
+        Ok(false) // we wrote it ourselves — tell the library not to also extract it
+    })?;
+
+    Ok(())
+}
+
+//MARK: VFS Scan RAR
+//SLOP
+fn vfs_scan_rar(archive_path: &Path, origin_path: &str) -> VFSNode {
+    let mut tree: VFSTree = VFSTree::new();
+
+    for entry in unrar::Archive::new(archive_path).open_for_listing().unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.filename.to_string_lossy().replace('\\', "/");
+        insert_zip_entry(&mut tree, Path::new(&name), origin_path, entry.is_directory());
+    }
+
+    VFSNode::Dir(tree)
+}
+
+//MARK: RAR extraction
+//SLOP
+fn extract_dir_from_rar(
+    archive_path: &Path,
+    dir_prefix: &str,
+    output_root: &Path,
+) -> unrar::error::UnrarResult<()> {
+    let prefix = if dir_prefix.is_empty() {
+        String::new()
+    } else if dir_prefix.ends_with('/') {
+        dir_prefix.to_string()
+    } else {
+        format!("{}/", dir_prefix)
+    };
+
+    let mut archive = unrar::Archive::new(archive_path).open_for_processing()?;
+
+    while let Some(cursor) = archive.read_header()? {
+        let entry = cursor.entry();
+        let name = entry.filename.to_string_lossy().replace('\\', "/");
+
+        let matches = prefix.is_empty()
+            || (name.starts_with(&prefix) && name.len() > prefix.len());
+
+        if matches && !entry.is_directory() {
+            let relative = if prefix.is_empty() { name.as_str() } else { &name[prefix.len()..] };
+            let out_path = output_root.join(relative);
+            if let Some(parent) = out_path.parent() {
+                fs::create_dir_all(parent).expect("Couldn't create directory");
+            }
+
+            let (data, rest) = cursor.read()?;
+            fs::write(&out_path, data).expect("Couldn't write file");
+            archive = rest;
+        } else if matches && entry.is_directory() {
+            let relative = if prefix.is_empty() { name.as_str() } else { &name[prefix.len()..] };
+            if !relative.is_empty() {
+                fs::create_dir_all(output_root.join(relative)).expect("Couldn't create directory");
+            }
+            archive = cursor.skip()?;
+        } else {
+            archive = cursor.skip()?;
         }
     }
 
