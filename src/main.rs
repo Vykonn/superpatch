@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use sevenz_rust2::{Archive, ArchiveEntry, Password, decompress_with_extract_fn};
 use zip::ZipArchive;
 use std::ffi::OsStr;
+use std::fs::remove_dir_all;
 use std::io::{self, Read, Seek};
 use std::sync::{Arc, Mutex};
 use std::{fs, thread};
@@ -120,6 +121,8 @@ struct LiveData {
     install_modal_vfs_data: Option<VFSNode>,
     install_modal_input_data: InstallModalInputData,
     install_modal_install_data: Option<InstallModalInstallData>,
+    install_modal_requested_install_index: usize,
+    install_modal_requested_install_index_target: SpecificIndexTarget,
     text_input_modal_open: bool,
     text_input_modal_type: TextInputType,
     text_input_modal_value: String,
@@ -168,8 +171,14 @@ struct InstallModalInstallData {
     name: String,
     version: String,
     category: String,
-    specific_index_active: bool,
+    specific_index_target: SpecificIndexTarget,
     specific_index: usize
+}
+#[derive(Clone, PartialEq)]
+enum SpecificIndexTarget {
+    Last,
+    Replace,
+    Before
 }
 
 impl SuperPatchApp {
@@ -210,6 +219,8 @@ impl SuperPatchApp {
                 install_modal_vfs_data: None,
                 install_modal_input_data: InstallModalInputData::None,
                 install_modal_install_data: None,
+                install_modal_requested_install_index: 0,
+                install_modal_requested_install_index_target: SpecificIndexTarget::Last,
                 text_input_modal_open: false,
                 text_input_modal_type: TextInputType::None,
                 text_input_modal_value: String::new(),
@@ -331,15 +342,16 @@ impl SuperPatchApp {
         };
     }
     fn check_mod_type(&mut self) {
-        //Basic installer (choose root directory) (upgrade with multiple roots)
-        //Autodetect root (how)
-        //Autodetect multiple roots & prompt (how)
-        //fomod Wizard (https://nexus-mods.github.io/NexusMods.App/developers/misc/AboutFomod/)
-        //BAIN Wizard (https://wrye-bash.github.io/docs/Wrye%20Bash%20Technical%20Readme.html) (I've never seen this)
         //TODO Mods: Detect selectors and wizards.
-        //Detect FOMOD or BAIN
-        //Detect Roots
-        //Give up.
+        //One root, skip
+
+        //Multiple roots, selector
+
+        //FOMOD, wizard / selector (https://nexus-mods.github.io/NexusMods.App/developers/misc/AboutFomod/)
+
+        //BAIN, wizard / selector (https://wrye-bash.github.io/docs/Wrye%20Bash%20Technical%20Readme.html) (I've never seen this)
+
+        //Basic installer
         self.livedata.install_modal_type = InstallModalType::Basic;
     }
     fn install_mod(&mut self) {
@@ -362,22 +374,27 @@ impl SuperPatchApp {
         }
         let target_path = Path::new("mods").join(install_data.name.clone());
         let file = std::fs::File::open(&self.livedata.install_modal_path).unwrap();
+        //If you were replacing the mod, delete the old mod data.
+        if install_data.specific_index_target == SpecificIndexTarget::Replace {
+            let replace_folder = self.orderdata.get(install_data.specific_index).unwrap().get("path").unwrap_or(&Value::Null);   
+            if let Value::String(string) = replace_folder
+            && !string.is_empty() {
+                let replace_path = Path::new(string);
+                if replace_path.exists() {
+                    fs::remove_dir_all(replace_path).unwrap();
+                }
+            }
+        }
         match extension_type {
             "zip" => {
                 let mut archive = zip::ZipArchive::new(file).unwrap();
-                for directory in &install_data.selected_paths {
-                    extract_dir_from_zip(&mut archive, directory, &target_path).expect("Failed to extract directory from zip");
-                }
+                extract_dirs_from_zip(&mut archive, install_data.selected_paths.clone(), &target_path).expect("Failed to extract directory from zip");
             },
             "rar" => {
-                for directory in &install_data.selected_paths {
-                    extract_dir_from_rar(&self.livedata.install_modal_path, directory, &target_path).expect("Failed to extract directory from rar");
-                }
+                extract_dirs_from_rar(&self.livedata.install_modal_path, install_data.selected_paths.clone(), &target_path).expect("Failed to extract directory from rar");
             },
             "7z" => {
-                for directory in &install_data.selected_paths {
-                    extract_dir_from_7z(file.try_clone().unwrap(), directory, &target_path).expect("Failed to extract directory from 7z");
-                }
+                extract_dirs_from_7z(file.try_clone().unwrap(), install_data.selected_paths.clone(), &target_path).expect("Failed to extract directory from 7z");
             },
             _ => panic!()
         }
@@ -389,33 +406,54 @@ impl SuperPatchApp {
             let src = Path::new(&self.livedata.install_modal_path);
             let file_name = src.file_name().expect("Archive path has no file name");
             let dst = Path::new("archives").join(file_name);
-
-            // Try hardlink first (same filesystem, instant, no extra disk usage)
-            match fs::hard_link(src, &dst) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {
-                    // Different filesystem — fall back to a full copy
-                    fs::copy(src, &dst).expect("Failed to copy archive to archives directory");
+            if src != dst {
+                // Try hardlink first (same filesystem, instant, no extra disk usage)
+                match fs::hard_link(src, &dst) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::CrossesDevices => {
+                        // Different filesystem — fall back to a full copy
+                        fs::copy(src, &dst).expect("Failed to copy archive to archives directory");
+                    }
+                    Err(e) => {
+                        panic!("Failed to hardlink or copy archive: {}", e);
+                    }
                 }
-                Err(e) => {
-                    panic!("Failed to hardlink or copy archive: {}", e);
+                //If you were replacing the mod, (and it's in a different path), delete the old mod's archive.
+                if install_data.specific_index_target == SpecificIndexTarget::Replace {
+                    let old_archive = self.orderdata.get(install_data.specific_index).unwrap().get("archive").unwrap_or(&Value::Null);
+                    if let Value::String(string) = old_archive
+                    && !string.is_empty() {
+                        let archive_path = Path::new(string);
+                        if archive_path.exists() {
+                            fs::remove_file(archive_path).expect("Archive could not be deleted.");
+                        }
+                    }
                 }
             }
-
             archive_path = dst.to_string_lossy().to_string();
         }
         if install_data.delete_archive {
             fs::remove_file(self.livedata.install_modal_path.clone()).expect("Failed to delete archive");
         }
-        //TODO Mods: Insert at specific location if exists
-        self.orderdata.as_array_mut().unwrap().push(json!({
+        let mut entry = json!({
             "enabled": true,
             "name": install_data.name,
             "path": target_path.to_string_lossy().to_string(),
             "version": install_data.version,
             "category": install_data.category,
             "archive": archive_path
-        }));
+        });
+        match install_data.specific_index_target {
+            SpecificIndexTarget::Replace => {
+                *self.orderdata.as_array_mut().unwrap().get_mut(install_data.specific_index).unwrap() = entry;
+            },
+            SpecificIndexTarget::Before => {
+                self.orderdata.as_array_mut().unwrap().insert(install_data.specific_index, entry);
+            },
+            SpecificIndexTarget::Last => {
+                self.orderdata.as_array_mut().unwrap().push(entry);
+            }
+        }
         self.update_all();
         *self.status.lock().unwrap() = "Mod installed.".to_string();
     }
@@ -568,7 +606,7 @@ impl eframe::App for SuperPatchApp {
             }
         }
         //MARK: Import Modal
-        //TODO Mods: Import from MO2
+        //TODO Tools: Import from MO2
         //Modal
         //MO2 Path
         //Instance Path
@@ -610,7 +648,8 @@ impl eframe::App for SuperPatchApp {
                         match self.livedata.install_modal_type {
                             //MARK: Basic Installation
                             InstallModalType::Basic => {
-                                ui.label("Mod type not detected. Please manually select roots.");
+                                ui.label("Mod type not detected. Please manually select root(s).");
+                                ui.label("Manual modification of mod folder after install is permitted in this scenario.");
                                 ui.vertical(|ui| { 
                                     if input_data.current_path.is_empty() {
                                         if input_data.selected_paths.contains(&String::new()) {
@@ -655,10 +694,8 @@ impl eframe::App for SuperPatchApp {
                                     let (name, version) = parse_archive_name(self.livedata.install_modal_path.file_stem().unwrap().to_str().unwrap());
                                     let copy_archive = self.settings["copy_archive"].as_bool().unwrap_or(true);
                                     let delete_archive = self.settings["delete_archive"].as_bool().unwrap_or(true);
-                                    //TODO Mods: Set specific location if dragged in
-                                    self.livedata.install_modal_install_data = Some(InstallModalInstallData { selected_paths: input_data.selected_paths.clone(), copy_archive, delete_archive, name: name.clone(), version, category: String::new(), specific_index_active: false, specific_index: 0 })
+                                    self.livedata.install_modal_install_data = Some(InstallModalInstallData { selected_paths: input_data.selected_paths.clone(), copy_archive, delete_archive, name: name.clone(), version, category: String::new(), specific_index: self.livedata.install_modal_requested_install_index, specific_index_target: self.livedata.install_modal_requested_install_index_target.clone()})
                                 }
-
                             },
                             //TODO Mods: Implement selectors and wizards
                             _ => {ui.close()}
@@ -685,6 +722,7 @@ impl eframe::App for SuperPatchApp {
                         ui.horizontal(|ui| {
                             if ui.checkbox(&mut copy_archive, "").changed() {
                                 self.settings["copy_archive"] = Value::Bool(copy_archive);
+                                install_data.copy_archive = copy_archive;
                                 save_settings(self.settings.clone());
                             }
                             ui.label("Copy Archive")
@@ -693,6 +731,7 @@ impl eframe::App for SuperPatchApp {
                         ui.horizontal(|ui| {
                             if ui.checkbox(&mut delete_archive, "").changed() {
                                 self.settings["delete_archive"] = Value::Bool(delete_archive);
+                                install_data.delete_archive = delete_archive;
                                 save_settings(self.settings.clone());
                             }
                             ui.label("Delete Orginal Archive")
@@ -717,6 +756,8 @@ impl eframe::App for SuperPatchApp {
                 self.livedata.install_modal_vfs_data = None;
                 self.livedata.install_modal_input_data = InstallModalInputData::None;
                 self.livedata.install_modal_install_data = None;
+                self.livedata.install_modal_requested_install_index = 0;
+                self.livedata.install_modal_requested_install_index_target = SpecificIndexTarget::Last;
             }
         }
         //MARK: Text input modal
@@ -742,6 +783,8 @@ impl eframe::App for SuperPatchApp {
                         if let Some(path_full) = path {
                             self.livedata.install_modal_open = true;
                             self.livedata.install_modal_path = path_full;
+                            self.livedata.install_modal_requested_install_index = 0;
+                            self.livedata.install_modal_requested_install_index_target = SpecificIndexTarget::Last;
                         }
                     }
                     if ui.button("Refresh").clicked() {
@@ -974,6 +1017,7 @@ impl eframe::App for SuperPatchApp {
                                     *self.status.lock().unwrap() = if enabled { "Enabled mod.".to_string() } else { "Disabled mod.".to_string() };
                                 });
                             });
+                            //FIXME General: If you right click one of the labels it doesn't give you a right click menu.
                             for i in [("name", name, OrganizeSortEditType::Name), ("category", category, OrganizeSortEditType::Category), ("version", version, OrganizeSortEditType::Version)] {
                                 row.col(|ui| {
                                     if self.livedata.organizeedit_type == i.2
@@ -1046,6 +1090,7 @@ impl eframe::App for SuperPatchApp {
                                         self.update_all();
                                     }
                                 }
+                                //TODO Mods: Drag and drop mods
                             }
                             response.context_menu(|ui| {
                                 if ui.button(if enabled { "Disable" } else { "Enable" }).clicked() {
@@ -1079,22 +1124,40 @@ impl eframe::App for SuperPatchApp {
                                     if mod_entry.path.as_str() != "" {
                                         fs::remove_dir_all(mod_entry.path.as_str()).expect("Failed to delete mod directory");
                                     }
-                                    let archive = self.orderdata.get(priority as usize).unwrap().get("archive").unwrap();
+                                    let archive = self.orderdata.get(priority as usize).unwrap().get("archive").unwrap_or(&Value::Null);
                                     if let Value::String(string) = archive
-                                        && !string.is_empty() {
-                                            let archive_path = Path::new("archives").join(string); 
+                                    && !string.is_empty() {
+                                        let archive_path = Path::new(string);
+                                        if fs::exists(archive_path).unwrap() {
                                             fs::remove_file(archive_path).expect("Archive could not be deleted.");
                                         }
+                                    }
                                     self.orderdata.as_array_mut().unwrap().remove(priority as usize);
                                     self.update_all();
                                     *self.status.lock().unwrap() = "Deleted mod.".to_string();
                                 }
-                                if ui.button("Reinstall mod").clicked() {  
-                                    //TODO Mods: Reinstall mod (Store in order.json and re-run installation)
-                                    //Also, disable this button if the path is empty or the file doesn't exist.
+                                let archive_exists = matches!(self.orderdata.get(priority as usize).unwrap_or(&Value::Null).get("archive").unwrap_or(&Value::Null), Value::String(string) if !string.is_empty());
+                                if ui.add_enabled(archive_exists, egui::Button::new("Reinstall mod")).clicked() {  
+                                    let archive = self.orderdata.get(priority as usize).unwrap().get("archive").unwrap_or(&Value::Null);
+                                    if let Value::String(string) = archive
+                                    && !string.is_empty() {
+                                        let archive_path = Path::new(string);
+                                        if fs::exists(archive_path).unwrap() {
+                                            self.livedata.install_modal_open = true;
+                                            self.livedata.install_modal_path = archive_path.to_path_buf();
+                                            self.livedata.install_modal_requested_install_index = priority as usize;
+                                            self.livedata.install_modal_requested_install_index_target = SpecificIndexTarget::Replace;
+                                        } else {
+                                            self.orderdata.get_mut(priority as usize).unwrap().get_mut("archive").unwrap_or(&mut Value::Null).take();
+                                            *self.status.lock().unwrap() = "Archive could not be found.".to_string();
+                                        }
+                                    }
+
+                                    
                                 }
                                 if ui.button("Update mod").clicked() {
                                     //TODO Mods: Update mod (New install sequence with new file prompt, keep path.)
+                                    //Specific index here, Replace
                                 }
                                 if ui.button("Open mod folder").clicked() {
                                     let mod_path = mod_entry.path.as_str();
@@ -1122,7 +1185,9 @@ impl eframe::App for SuperPatchApp {
                                     ui.label(self.orderdata[payload as usize]["name"].as_str().unwrap_or(""));
                                 });
                         }
-                        //TODO General: Scroll when you reach the bottom or top of the screen while dragging
+                    }
+                    if egui::DragAndDrop::has_any_payload(ui.ctx()) {
+                        //TODO General: Scroll when touching edges of screen & dragging.
                     }
                 }
                 //MARK: Files Page
@@ -1679,7 +1744,7 @@ fn vfs_scan_zip<R: Read + Seek>(
 }
 //SLOP
 // Walk the path components of a single zip entry, creating/descending into
-// VFSTree dirs as needed, then inserting the final file/dir node.
+// VFSTree dirs as needed, then inserting the final file/dir node.\
 fn insert_zip_entry(
     tree: &mut VFSTree,
     path: &std::path::Path,
@@ -1732,51 +1797,49 @@ fn insert_zip_entry(
 }
 //MARK: ZIP Extraction
 //SLOP
-fn extract_dir_from_zip(
+//FIXME Mods: If a selected_path is in another selected_path, ignore it in the containing selected_path. 
+fn extract_dirs_from_zip(
     archive: &mut ZipArchive<impl io::Read + io::Seek>,
-    dir_prefix: &str, // e.g. "some/subdir/"
+    dir_list: Vec<String>, // e.g. "some/subdir/"
     output_root: &Path,
 ) -> zip::result::ZipResult<()> {
-    // Normalize prefix to always end with '/'
-    let prefix = if dir_prefix.ends_with('/') || dir_prefix.is_empty() {
-        dir_prefix.to_string()
-    } else {
-        format!("{}/", dir_prefix)
-    };
-
-    for i in 0..archive.len() {
-        let mut file = archive.by_index(i)?;
-        let name = file.name().to_string();
-
-        // Only process entries under the target directory
-        if !name.starts_with(&prefix) {
-            continue;
-        }
-
-        // Compute the path relative to the extracted directory
-        let relative = &name[prefix.len()..];
-        if relative.is_empty() {
-            continue; // this is the directory entry itself
-        }
-
-        let out_path = output_root.join(relative);
-
-        if file.is_dir() {
-            fs::create_dir_all(&out_path)?;
+    for dir_prefix in dir_list {
+        // Normalize prefix to always end with '/'
+        let prefix = if dir_prefix.ends_with('/') || dir_prefix.is_empty() {
+            dir_prefix.to_string()
         } else {
-            if let Some(parent) = out_path.parent() {
-                fs::create_dir_all(parent)?;
-            }
-            let mut out_file = fs::File::create(&out_path)?;
-            io::copy(&mut file, &mut out_file)?;
-        }
+            format!("{}/", dir_prefix)
+        };
 
-        // Preserve Unix permissions if available
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Some(mode) = file.unix_mode() {
-                fs::set_permissions(&out_path, fs::Permissions::from_mode(mode))?;
+        for i in 0..archive.len() {
+            let mut file = archive.by_index(i)?;
+            let name = file.name().to_string();
+            // Only process entries under the target directory
+            if !name.starts_with(&prefix) {
+                continue;
+            }
+            // Compute the path relative to the extracted directory
+            let relative = &name[prefix.len()..];
+            if relative.is_empty() {
+                continue; // this is the directory entry itself
+            }
+            let out_path = output_root.join(relative);
+            if file.is_dir() {
+                fs::create_dir_all(&out_path)?;
+            } else {
+                if let Some(parent) = out_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                let mut out_file = fs::File::create(&out_path)?;
+                io::copy(&mut file, &mut out_file)?;
+            }
+            // Preserve Unix permissions if available
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Some(mode) = file.unix_mode() {
+                    fs::set_permissions(&out_path, fs::Permissions::from_mode(mode))?;
+                }
             }
         }
     }
@@ -1803,42 +1866,44 @@ fn vfs_scan_7z<R: Read + Seek>(
 
 //MARK: 7Z Extraction
 //SLOP
-fn extract_dir_from_7z(
-    reader: impl Read + std::io::Seek,
-    dir_prefix: &str,
+//FIXME Mods: If a selected_path is in another selected_path, ignore it in the containing selected_path. 
+fn extract_dirs_from_7z(
+    mut reader: impl Read + std::io::Seek,
+    dir_list: Vec<String>,
     output_root: &Path,
 ) -> Result<(), sevenz_rust2::Error> {
-    let prefix = if dir_prefix.is_empty() {
-        String::new()
-    } else if dir_prefix.ends_with('/') {
-        dir_prefix.to_string()
-    } else {
-        format!("{}/", dir_prefix)
-    };
-
-    decompress_with_extract_fn(reader, output_root, |entry: &ArchiveEntry, entry_reader: &mut dyn Read, _dest_path: &PathBuf| {
-        let name = entry.name.replace('\\', "/");
-
-        if !prefix.is_empty() && (!name.starts_with(&prefix) || name.len() == prefix.len()) {
-            return Ok(false); // not under target dir, or is the dir entry itself
-        }
-
-        let relative = if prefix.is_empty() { name.as_str() } else { &name[prefix.len()..] };
-        let out_path = output_root.join(relative);
-
-        if entry.is_directory {
-            fs::create_dir_all(&out_path)?;
+    for dir_prefix in dir_list {
+        let prefix = if dir_prefix.is_empty() {
+            String::new()
+        } else if dir_prefix.ends_with('/') {
+            dir_prefix.to_string()
         } else {
-            if let Some(parent) = out_path.parent() {
-                fs::create_dir_all(parent)?;
+            format!("{}/", dir_prefix)
+        };
+
+        decompress_with_extract_fn(&mut reader, output_root, |entry: &ArchiveEntry, entry_reader: &mut dyn Read, _dest_path: &PathBuf| {
+            let name = entry.name.replace('\\', "/");
+
+            if !prefix.is_empty() && (!name.starts_with(&prefix) || name.len() == prefix.len()) {
+                return Ok(false); // not under target dir, or is the dir entry itself
             }
-            let mut out_file = fs::File::create(&out_path)?;
-            io::copy(entry_reader, &mut out_file)?;
-        }
 
-        Ok(false) // we wrote it ourselves — tell the library not to also extract it
-    })?;
+            let relative = if prefix.is_empty() { name.as_str() } else { &name[prefix.len()..] };
+            let out_path = output_root.join(relative);
 
+            if entry.is_directory {
+                fs::create_dir_all(&out_path)?;
+            } else {
+                if let Some(parent) = out_path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                let mut out_file = fs::File::create(&out_path)?;
+                io::copy(entry_reader, &mut out_file)?;
+            }
+
+            Ok(false) // we wrote it ourselves — tell the library not to also extract it
+        })?;
+    }
     Ok(())
 }
 
@@ -1858,49 +1923,51 @@ fn vfs_scan_rar(archive_path: &Path, origin_path: &str) -> VFSNode {
 
 //MARK: RAR extraction
 //SLOP
-fn extract_dir_from_rar(
+//FIXME Mods: If a selected_path is in another selected_path, ignore it in the containing selected_path. 
+fn extract_dirs_from_rar(
     archive_path: &Path,
-    dir_prefix: &str,
+    dir_list: Vec<String>,
     output_root: &Path,
 ) -> unrar::error::UnrarResult<()> {
-    let prefix = if dir_prefix.is_empty() {
-        String::new()
-    } else if dir_prefix.ends_with('/') {
-        dir_prefix.to_string()
-    } else {
-        format!("{}/", dir_prefix)
-    };
-
-    let mut archive = unrar::Archive::new(archive_path).open_for_processing()?;
-
-    while let Some(cursor) = archive.read_header()? {
-        let entry = cursor.entry();
-        let name = entry.filename.to_string_lossy().replace('\\', "/");
-
-        let matches = prefix.is_empty()
-            || (name.starts_with(&prefix) && name.len() > prefix.len());
-
-        if matches && !entry.is_directory() {
-            let relative = if prefix.is_empty() { name.as_str() } else { &name[prefix.len()..] };
-            let out_path = output_root.join(relative);
-            if let Some(parent) = out_path.parent() {
-                fs::create_dir_all(parent).expect("Couldn't create directory");
-            }
-
-            let (data, rest) = cursor.read()?;
-            fs::write(&out_path, data).expect("Couldn't write file");
-            archive = rest;
-        } else if matches && entry.is_directory() {
-            let relative = if prefix.is_empty() { name.as_str() } else { &name[prefix.len()..] };
-            if !relative.is_empty() {
-                fs::create_dir_all(output_root.join(relative)).expect("Couldn't create directory");
-            }
-            archive = cursor.skip()?;
+    for dir_prefix in dir_list {
+        let prefix = if dir_prefix.is_empty() {
+            String::new()
+        } else if dir_prefix.ends_with('/') {
+            dir_prefix.to_string()
         } else {
-            archive = cursor.skip()?;
+            format!("{}/", dir_prefix)
+        };
+
+        let mut archive = unrar::Archive::new(archive_path).open_for_processing()?;
+
+        while let Some(cursor) = archive.read_header()? {
+            let entry = cursor.entry();
+            let name = entry.filename.to_string_lossy().replace('\\', "/");
+
+            let matches = prefix.is_empty()
+                || (name.starts_with(&prefix) && name.len() > prefix.len());
+
+            if matches && !entry.is_directory() {
+                let relative = if prefix.is_empty() { name.as_str() } else { &name[prefix.len()..] };
+                let out_path = output_root.join(relative);
+                if let Some(parent) = out_path.parent() {
+                    fs::create_dir_all(parent).expect("Couldn't create directory");
+                }
+
+                let (data, rest) = cursor.read()?;
+                fs::write(&out_path, data).expect("Couldn't write file");
+                archive = rest;
+            } else if matches && entry.is_directory() {
+                let relative = if prefix.is_empty() { name.as_str() } else { &name[prefix.len()..] };
+                if !relative.is_empty() {
+                    fs::create_dir_all(output_root.join(relative)).expect("Couldn't create directory");
+                }
+                archive = cursor.skip()?;
+            } else {
+                archive = cursor.skip()?;
+            }
         }
     }
-
     Ok(())
 }
 

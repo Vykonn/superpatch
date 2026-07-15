@@ -18,3 +18,7 @@ sevenz-rust2 = "0.21.3"
 sysinfo = "0.39.6"
 unrar = "0.5.8"
 zip = "8.6.0"
+
+[profile.release]
+strip = true
+lto = true
