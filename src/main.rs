@@ -7,10 +7,10 @@ use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use rayon::slice::ParallelSliceMut;
 use regex::Regex;
 use serde_json::{Value, json};
-use sevenz_rust2::{Archive, ArchiveEntry, Password, decompress_with_extract_fn};
+use sevenz_rust2::{Archive, Password};
 use zip::ZipArchive;
 use std::ffi::OsStr;
-use std::fs::remove_dir_all;
+use std::fs::File;
 use std::io::{self, Read, Seek};
 use std::sync::{Arc, Mutex};
 use std::{fs, thread};
@@ -118,7 +118,7 @@ struct LiveData {
     install_modal_open: bool,
     install_modal_path: PathBuf,
     install_modal_type: InstallModalType,
-    install_modal_vfs_data: Option<VFSNode>,
+    install_modal_vfs_data: Option<ArchiveVFSTree>,
     install_modal_input_data: InstallModalInputData,
     install_modal_install_data: Option<InstallModalInstallData>,
     install_modal_requested_install_index: usize,
@@ -132,6 +132,12 @@ struct LiveData {
     organizeedit_index: usize,
     organizeedit_value: String,
 }
+type ArchiveVFSTree = BTreeMap<String, ArchiveVFSNode>;
+#[derive(Clone)]
+enum ArchiveVFSNode {
+    Dir(ArchiveVFSTree),
+    File(String)
+}
 #[derive(Clone, PartialEq)]
 enum TextInputType {
     None,
@@ -140,7 +146,7 @@ enum TextInputType {
 #[derive(Clone, PartialEq)]
 enum InstallModalType {
     None,
-    Basic,
+    Manual,
     Skip,
     Select,
     Wizard
@@ -148,31 +154,50 @@ enum InstallModalType {
 #[derive(Clone, PartialEq)]
 enum InstallModalInputData {
     None,
-    SortData(InstallModalSortData)
+    Manual(ManualInstallData)
+}
+
+#[derive(Clone, PartialEq)]
+struct ManualInstallData {
+    display_path: String,
+    display_list: Vec<ManualInstallEntry>,
+    //Don't include it in roots. Extract contents as a root.
+    root_list: Vec<String>,
+    //Don't include it roots.
+    remove_list: Vec<String>
 }
 #[derive(Clone, PartialEq)]
-struct InstallModalSortData {
-    list: Vec<InstallModalListEntry>,
-    current_path: String,
-    selected_paths: Vec<String>
-}
-#[derive(Clone, PartialEq)]
-struct InstallModalListEntry {
+struct ManualInstallEntry {
     name: String,
     path: String,
     folder: bool,
-    selected: bool
+    state: ManualInstallEntryState
+}
+#[derive(Clone,PartialEq)]
+enum ManualInstallEntryState {
+    //Neither this or its parent are in the root_list or remove_list
+    None,
+    //This is in the root_list
+    Root,
+    //This is not in any list, but its parent is in the root_list.
+    ProxyRoot,
+    //This is in the remove_list
+    Remove,
+    //This is not in any list, but its parent is in the remove_list.
+    ProxyRemove
 }
 #[derive(Clone)]
 struct InstallModalInstallData {
-    selected_paths: Vec<String>,
+    root_list: Vec<String>,
+    remove_list: Vec<String>,
     copy_archive: bool,
     delete_archive: bool,
     name: String,
     version: String,
     category: String,
     specific_index_target: SpecificIndexTarget,
-    specific_index: usize
+    specific_index: usize,
+    website: String
 }
 #[derive(Clone, PartialEq)]
 enum SpecificIndexTarget {
@@ -255,60 +280,6 @@ impl SuperPatchApp {
         self.livedata.settingsedit_type = SettingsEditType::None;
         
     }
-    fn update_install_modal_sort_list(&mut self) {
-        let vfs_data = self.livedata.install_modal_vfs_data.take().unwrap();
-        let mut vfs_tree = match vfs_data {
-            VFSNode::Dir(tree) => tree,
-            _ => panic!()
-        };
-        let mut sort_list = Vec::<InstallModalListEntry>::new();
-        let current_path = match &self.livedata.install_modal_input_data {
-            InstallModalInputData::SortData(data) => {data.current_path.clone()},
-            _ => {String::new()}
-        };
-        let selected_paths = match &self.livedata.install_modal_input_data {
-            InstallModalInputData::SortData(data) => {data.selected_paths.clone()},
-            _ => {vec![]}
-        };
-        if !current_path.is_empty() {
-            for segment in current_path.split('/') {
-                if segment.is_empty() {
-                    continue;
-                }
-                match vfs_tree.remove(segment) {
-                    Some(VFSNode::Dir(subtree)) => {
-                        vfs_tree = subtree;
-                    }
-                    Some(VFSNode::File(_)) => {
-                        panic!("path segment '{}' is a file, not a directory", segment);
-                    }
-                    None => {
-                        panic!("path segment '{}' not found in VFS tree", segment);
-                    }
-                }
-            }
-        }
-        for entry in vfs_tree {
-            let mut new_entry = InstallModalListEntry {name: String::new(), path: String::new(), folder: false, selected: false};
-            new_entry.folder = match entry.1 {
-                VFSNode::Dir(_) => true,
-                VFSNode::File(_) => false
-            };
-            new_entry.name = pathdiff(entry.0.as_str(), current_path.as_str());
-            new_entry.path = if current_path.is_empty() {
-                entry.0.clone()
-            } else {
-                format!("{}/{}", current_path, entry.0)
-            };
-            new_entry.selected = selected_paths.iter().any(|path_entry| path_entry == &new_entry.path);
-            sort_list.push(new_entry);
-        };
-        self.livedata.install_modal_input_data = InstallModalInputData::SortData(InstallModalSortData {
-            list: sort_list,
-            current_path,
-            selected_paths
-        });
-    }
     fn scan_mod_data(&mut self) {
         //Make VFS data for mod from archive.
         let ext = self.livedata.install_modal_path.extension().unwrap();
@@ -328,31 +299,83 @@ impl SuperPatchApp {
         let mut file = std::fs::File::open(&self.livedata.install_modal_path).unwrap();
         self.livedata.install_modal_vfs_data = match extension_type {
             "zip" => {
-
                 let mut archive = zip::ZipArchive::new(file).unwrap();
-                Some(vfs_scan_zip(&mut archive, self.livedata.install_modal_path.to_str().unwrap()).unwrap())
+                Some(vfs_scan_zip(&mut archive, self.livedata.install_modal_path.to_str().unwrap()))
             },
             "rar" => {
                 Some(vfs_scan_rar(&self.livedata.install_modal_path, self.livedata.install_modal_path.to_str().unwrap()))
             },
             "7z" => {
-                Some(vfs_scan_7z(&mut file, self.livedata.install_modal_path.to_str().unwrap()).unwrap())
+                Some(vfs_scan_7z(&mut file, self.livedata.install_modal_path.to_str().unwrap()))
             },
             _ => panic!()
         };
     }
     fn check_mod_type(&mut self) {
         //TODO Mods: Detect selectors and wizards.
+
+        //FOMOD wizard (https://nexus-mods.github.io/NexusMods.App/developers/misc/AboutFomod/) (https://stepmodifications.org/wiki/Guide:FOMOD)
+
         //One root, skip
 
         //Multiple roots, selector
+            //All in one root (BAIN included)
+            //Optional
 
-        //FOMOD, wizard / selector (https://nexus-mods.github.io/NexusMods.App/developers/misc/AboutFomod/)
+        //Manual installer
+        self.livedata.install_modal_type = InstallModalType::Manual;
+    }
+    fn install_modal_update_input_data_manual(&mut self) {
+        let mut data = match &self.livedata.install_modal_input_data {
+            InstallModalInputData::Manual(data) => {ManualInstallData { display_path: data.display_path.clone(), display_list: Vec::new(), root_list: data.root_list.clone(), remove_list: data.remove_list.clone() }}
+            _ => {ManualInstallData { display_path: String::new(), display_list: Vec::new(), root_list: Vec::new(), remove_list: Vec::new() }}
+        };
+        let mut vfs_data = self.livedata.install_modal_vfs_data.take().unwrap();
+        if !data.display_path.is_empty() {
+            for segment in data.display_path.split('/') {
+                if segment.is_empty() {
+                    continue;
+                }
+                match vfs_data.remove(segment) {
+                    Some(ArchiveVFSNode::Dir(subtree)) => {
+                        vfs_data = subtree;
+                    }
+                    Some(ArchiveVFSNode::File(_)) => {
+                        panic!("path segment '{}' is a file, not a directory", segment);
+                    }
+                    None => {
+                        panic!("path segment '{}' not found in VFS tree", segment);
+                    }
+                }
+            }
+        }
+        for entry in vfs_data {
+            let full_path = if data.display_path.is_empty() {
+                entry.0.clone()
+            } else {
+                format!("{}/{}", data.display_path, entry.0)
+            };
 
-        //BAIN, wizard / selector (https://wrye-bash.github.io/docs/Wrye%20Bash%20Technical%20Readme.html) (I've never seen this)
-
-        //Basic installer
-        self.livedata.install_modal_type = InstallModalType::Basic;
+            let mut new_entry = ManualInstallEntry {
+                name: pathdiff(entry.0.as_str(), data.display_path.as_str()),
+                path: full_path.clone(),
+                folder: matches!(entry.1, ArchiveVFSNode::Dir(_)),
+                state: ManualInstallEntryState::None,
+            };
+            new_entry.state =
+                if data.root_list.par_iter().any(|e| e == &full_path) {ManualInstallEntryState::Root}
+                else if data.remove_list.par_iter().any(|e| e == &full_path) {ManualInstallEntryState::Remove}
+                else {
+                    let test = parent_in_tf_list(&full_path, data.remove_list.clone(), data.root_list.clone());
+                    if test.0 {
+                        if test.1 {ManualInstallEntryState::ProxyRoot}
+                        else {ManualInstallEntryState::ProxyRemove}
+                    }
+                    else {ManualInstallEntryState::None}
+                };
+            data.display_list.push(new_entry);
+        };
+        self.livedata.install_modal_input_data = InstallModalInputData::Manual(data)
     }
     fn install_mod(&mut self) {
         let install_data = match &self.livedata.install_modal_install_data {
@@ -372,8 +395,6 @@ impl SuperPatchApp {
         if !Path::exists(Path::new("mods")) {
             fs::create_dir("mods").expect("Failed to create configs directory")
         }
-        let target_path = Path::new("mods").join(install_data.name.clone());
-        let file = std::fs::File::open(&self.livedata.install_modal_path).unwrap();
         //If you were replacing the mod, delete the old mod data.
         if install_data.specific_index_target == SpecificIndexTarget::Replace {
             let replace_folder = self.orderdata.get(install_data.specific_index).unwrap().get("path").unwrap_or(&Value::Null);   
@@ -385,16 +406,16 @@ impl SuperPatchApp {
                 }
             }
         }
+        let target_path = Path::new("mods").join(install_data.name.clone());
         match extension_type {
             "zip" => {
-                let mut archive = zip::ZipArchive::new(file).unwrap();
-                extract_dirs_from_zip(&mut archive, install_data.selected_paths.clone(), &target_path).expect("Failed to extract directory from zip");
+                archive_extract_zip(self.livedata.install_modal_path.clone(), target_path.clone(), install_data.root_list.clone(), install_data.remove_list.clone());
             },
             "rar" => {
-                extract_dirs_from_rar(&self.livedata.install_modal_path, install_data.selected_paths.clone(), &target_path).expect("Failed to extract directory from rar");
+                archive_extract_rar(self.livedata.install_modal_path.clone(), target_path.clone(), install_data.root_list.clone(), install_data.remove_list.clone());
             },
             "7z" => {
-                extract_dirs_from_7z(file.try_clone().unwrap(), install_data.selected_paths.clone(), &target_path).expect("Failed to extract directory from 7z");
+                archive_extract_7z(self.livedata.install_modal_path.clone(), target_path.clone(), install_data.root_list.clone(), install_data.remove_list.clone());
             },
             _ => panic!()
         }
@@ -435,13 +456,14 @@ impl SuperPatchApp {
         if install_data.delete_archive {
             fs::remove_file(self.livedata.install_modal_path.clone()).expect("Failed to delete archive");
         }
-        let mut entry = json!({
+        let entry = json!({
             "enabled": true,
             "name": install_data.name,
             "path": target_path.to_string_lossy().to_string(),
             "version": install_data.version,
             "category": install_data.category,
-            "archive": archive_path
+            "archive": archive_path,
+            "website": install_data.website
         });
         match install_data.specific_index_target {
             SpecificIndexTarget::Replace => {
@@ -623,6 +645,7 @@ impl eframe::App for SuperPatchApp {
         //MARK: Installation Modal
         if self.livedata.install_modal_open {
             let install_modal = Modal::new(Id::new("install_modal")).show(ui.ctx(), |ui| {
+                ui.style_mut().interaction.selectable_labels = false;
                 ui.heading("Install Mod");
                 if self.livedata.install_modal_path == PathBuf::new() && ui.button("Select Mod").clicked() {
                     let path = pick_mod_file();
@@ -636,51 +659,108 @@ impl eframe::App for SuperPatchApp {
                     if self.livedata.install_modal_type == InstallModalType::None {
                         self.check_mod_type();
                     }
-                    if self.livedata.install_modal_install_data.is_none() {
-                        if self.livedata.install_modal_input_data == InstallModalInputData::None {
-                            self.update_install_modal_sort_list();
+                    if self.livedata.install_modal_input_data == InstallModalInputData::None {
+                        match self.livedata.install_modal_type {
+                            InstallModalType::Manual => {self.install_modal_update_input_data_manual()}
+                            _ => panic!()
                         }
+                    }
+                    if self.livedata.install_modal_install_data.is_none() {
                         let input_data = match &mut self.livedata.install_modal_input_data {
-                            InstallModalInputData::SortData(sortdata) => sortdata,
+                            InstallModalInputData::Manual(sortdata) => sortdata,
                             _ => panic!()
                         };
-                        let mut needs_update = false;
                         match self.livedata.install_modal_type {
-                            //MARK: Basic Installation
-                            InstallModalType::Basic => {
-                                ui.label("Mod type not detected. Please manually select root(s).");
-                                ui.label("Manual modification of mod folder after install is permitted in this scenario.");
+                            //MARK: Manual Installation
+                            InstallModalType::Manual => {
+                                let mut needs_update = false;
+                                ui.label("Mod type not detected. Please manually select files.");
+                                //TODO Mods: Top 10 Puzzles of all time
+                                ui.label("R: Root, X: Excluded, +: Included by proxy, -: Excluded by proxy");
+                                ui.separator();
                                 ui.vertical(|ui| { 
-                                    if input_data.current_path.is_empty() {
-                                        if input_data.selected_paths.contains(&String::new()) {
-                                            if ui.button("Deselect root as root").clicked() {
-                                                input_data.selected_paths.retain_mut(|x| x != &String::new())
+                                    if input_data.display_path.is_empty() {
+                                        ui.horizontal(|ui| {
+                                            if input_data.root_list.par_iter().any(|x| x.is_empty()) {
+                                                ui.add_enabled(false, egui::Button::new("N"));
+                                                if ui.button("X").clicked() {
+                                                    input_data.root_list.retain(|x| !x.is_empty());
+                                                    needs_update = true;
+                                                }
+                                                ui.label("R");
+                                            } else {
+                                                if ui.button("R").clicked() {
+                                                    input_data.root_list.push("".to_string());
+                                                    needs_update = true;
+                                                }
+                                                ui.add_enabled(false, egui::Button::new("N"));
+                                                ui.label("X");
                                             }
-                                        } else {
-                                            if ui.button("Select root as root").clicked() {
-                                                input_data.selected_paths.push(String::new())
-                                            }
-                                        }
+                                            ui.label("[Archive Root]");
+                                        });
                                     }
-                                    if !input_data.current_path.is_empty() && ui.button("...").clicked() {
-                                            input_data.current_path = Path::new(&input_data.current_path.clone()).parent().and_then(|p| p.to_str()).unwrap_or("").to_string();
+                                    if !input_data.display_path.is_empty() && ui.add(egui::Label::new("...").sense(egui::Sense::click())).clicked() {
+                                            input_data.display_path = Path::new(&input_data.display_path.clone()).parent().and_then(|p| p.to_str()).unwrap_or("").to_string();
                                             needs_update = true;
                                         }
-                                    for entry in input_data.list.iter() {
+                                    for entry in input_data.display_list.iter() {
                                         ui.horizontal(|ui| {
-                                            let mut checked = entry.selected;
-                                            if ui.checkbox(&mut checked, "").changed() {
-                                                if checked {
-                                                input_data.selected_paths.push(entry.path.clone());
-                                                } else {
-                                                input_data.selected_paths.retain_mut(|x| x != &entry.path.clone());
+                                            match entry.state {
+                                                ManualInstallEntryState::Root => {
+                                                    if ui.button("=").clicked() {
+                                                        input_data.root_list.retain(|x| x != &entry.path.clone());
+                                                        needs_update = true;
+                                                    }
+                                                    if ui.button("X").clicked() {
+                                                        input_data.root_list.retain(|x| x != &entry.path.clone());
+                                                        input_data.remove_list.push(entry.path.clone());
+                                                        needs_update = true;
+                                                    }
+                                                    ui.label("R");
                                                 }
-                                                needs_update = true;
+                                                ManualInstallEntryState::Remove => {
+                                                    if ui.button("R").clicked() {
+                                                        input_data.remove_list.retain(|x| x != &entry.path.clone());
+                                                        input_data.root_list.push(entry.path.clone());
+                                                        needs_update = true;
+                                                    }
+                                                    if ui.button("=").clicked() {
+                                                        input_data.remove_list.retain(|x| x != &entry.path.clone());
+                                                        needs_update = true;
+                                                    }
+                                                    ui.label("X");
+                                                }
+                                                ManualInstallEntryState::ProxyRoot => {
+                                                    if ui.button("R").clicked() {
+                                                        input_data.root_list.push(entry.path.clone());
+                                                        needs_update = true;
+                                                    }
+                                                    if ui.button("X").clicked() {
+                                                        input_data.remove_list.push(entry.path.clone());
+                                                        needs_update = true;
+                                                    }
+                                                    ui.label("+");
+                                                }
+                                                ManualInstallEntryState::ProxyRemove => {
+                                                    if ui.button("R").clicked() {
+                                                        input_data.root_list.push(entry.path.clone());
+                                                        needs_update = true;
+                                                    }
+                                                    ui.add_enabled(false, egui::Button::new("N"));
+                                                    ui.label("-");
+                                                }
+                                                ManualInstallEntryState::None => {
+                                                    if ui.button("R").clicked() {
+                                                        input_data.root_list.push(entry.path.clone());
+                                                        needs_update = true;
+                                                    }
+                                                    ui.add_enabled(false, egui::Button::new("N"));
+                                                    ui.label("X");
+                                                }
                                             }
-                                            
                                             if entry.folder {
-                                                if ui.button(entry.name.clone()).clicked() {
-                                                    input_data.current_path = entry.path.clone();
+                                                if ui.add(egui::Label::new(entry.name.clone()).sense(egui::Sense::click())).clicked() {
+                                                    input_data.display_path = entry.path.clone();
                                                     needs_update = true;
                                                 } 
                                             }
@@ -690,33 +770,35 @@ impl eframe::App for SuperPatchApp {
                                         });
                                     }
                                 });
-                                if ui.add_enabled(!input_data.selected_paths.is_empty(), egui::Button::new("Proceed to Installation")).clicked() {
+                                ui.separator();
+                                if ui.add_enabled(!input_data.root_list.is_empty(), egui::Button::new("Proceed to Installation")).clicked() {
                                     let (name, version) = parse_archive_name(self.livedata.install_modal_path.file_stem().unwrap().to_str().unwrap());
                                     let copy_archive = self.settings["copy_archive"].as_bool().unwrap_or(true);
                                     let delete_archive = self.settings["delete_archive"].as_bool().unwrap_or(true);
-                                    self.livedata.install_modal_install_data = Some(InstallModalInstallData { selected_paths: input_data.selected_paths.clone(), copy_archive, delete_archive, name: name.clone(), version, category: String::new(), specific_index: self.livedata.install_modal_requested_install_index, specific_index_target: self.livedata.install_modal_requested_install_index_target.clone()})
+                                    self.livedata.install_modal_install_data = Some(InstallModalInstallData { root_list: input_data.root_list.clone(), remove_list: input_data.remove_list.clone(), copy_archive, delete_archive, name: name.clone(), version, category: String::new(), specific_index: self.livedata.install_modal_requested_install_index, specific_index_target: self.livedata.install_modal_requested_install_index_target.clone(), website: String::new()})
+                                }
+                                if needs_update {
+                                    self.install_modal_update_input_data_manual();
                                 }
                             },
                             //TODO Mods: Implement selectors and wizards
                             _ => {ui.close()}
                         }
-                        if needs_update {
-                            self.update_install_modal_sort_list();
-                        }
+
                     } 
                     //MARK: Final Installation
                     else {
-                        let mut install_data = match &mut self.livedata.install_modal_install_data {
+                        let install_data = match &mut self.livedata.install_modal_install_data {
                             Some(install_data) => install_data,
                             None => panic!()
                         };
-                        ui.label("Selected Paths:");
-                        for i in &install_data.selected_paths {
-                            if i.is_empty() {
-                                ui.label("[archive root]");
-                            } else {
-                                ui.label(i);
-                            }
+                        ui.label("Roots:");
+                        for i in install_data.root_list.clone() {
+                            ui.label(i);
+                        }
+                        ui.label("Exclusions:");
+                        for i in install_data.remove_list.clone() {
+                            ui.label(i);
                         }
                         let mut copy_archive = self.settings["copy_archive"].as_bool().unwrap_or(true);
                         ui.horizontal(|ui| {
@@ -742,6 +824,8 @@ impl eframe::App for SuperPatchApp {
                         ui.text_edit_singleline(&mut install_data.version);
                         ui.label("Category:");
                         ui.text_edit_singleline(&mut install_data.category);
+                        ui.label("Website:");
+                        ui.text_edit_singleline(&mut install_data.website);
                         if ui.button("Install Mod").clicked() {
                             self.install_mod();
                             ui.close();
@@ -1119,6 +1203,10 @@ impl eframe::App for SuperPatchApp {
                                     self.livedata.organizeedit_index = priority as usize;
                                     self.livedata.organizeedit_value = version.to_string();
                                 }
+
+                                if ui.button("Open Website").clicked() {
+                                    //TODO General: Add open website. Disable if field is empty.
+                                }
                                 if ui.button("Delete mod").clicked() {
                                     //TODO General: Warn user about deletion.
                                     if mod_entry.path.as_str() != "" {
@@ -1169,6 +1257,9 @@ impl eframe::App for SuperPatchApp {
                                         *self.status.lock().unwrap() = "Mod path is empty.".to_string();
                                     }
                                     ui.close();
+                                }
+                                if ui.button("Properties").clicked() {
+                                    //TODO General: Properties Modal.
                                 }
                             });
                         });
@@ -1411,6 +1502,51 @@ fn read_patch_data() -> Value {
 fn save_settings(settings: Value) {
     let text = serde_json::to_string_pretty(&settings).expect("Failed to serialize settings.json");
     fs::write("configs/settings.json", text).expect("Failed to write settings.json");
+}
+
+//MARK: Organize Sorting
+fn sort_organize_data(orderdata: Value, organizesort: OrganizeSort) -> Vec<OrganizeSortListEntry> {
+    let mut orderdata_array = orderdata.as_array().cloned().unwrap_or_else(Vec::new);
+    let mut organizesortlist = Vec::new();
+    //Add priority field
+    for (i, item) in orderdata_array.iter_mut().enumerate() {
+        organizesortlist.push(OrganizeSortListEntry {
+            enabled: item
+                .get("enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            name: item
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            category: item
+                .get("category")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            version: item
+                .get("version")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            priority: i as i64,
+            path: item
+                .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        });
+    }
+    match organizesort {
+        OrganizeSort::NameAsc => organizesortlist.par_sort_by(|a, b| a.name.cmp(&b.name)),
+        OrganizeSort::NameDesc => organizesortlist.par_sort_by(|a, b| b.name.cmp(&a.name)),
+        OrganizeSort::CategoryAsc => organizesortlist.par_sort_by(|a, b| a.category.cmp(&b.category)),
+        OrganizeSort::CategoryDesc => organizesortlist.par_sort_by(|a, b| b.category.cmp(&a.category)),
+        OrganizeSort::PriorityAsc => organizesortlist.par_sort_by_key(|a| a.priority),
+        OrganizeSort::PriorityDesc => organizesortlist.par_sort_by_key(|b| std::cmp::Reverse(b.priority)),
+    }
+    organizesortlist
 }
 
 //MARK: VFS Generation
@@ -1717,36 +1853,13 @@ fn fetch_saved_vfs_changes(mut current_dir: &Path) {
         }
     }
 }
-//MARK: VFS Scan ZIP
-//SLOP
-fn vfs_scan_zip<R: Read + Seek>(
-    archive: &mut ZipArchive<R>,
-    origin_path: &str, // e.g. the zip file's own path, used as the "source" key
-) -> Result<VFSNode, zip::result::ZipError> {
-    let mut root = VFSTree::new();
 
-    for i in 0..archive.len() {
-        let file = archive.by_index(i)?;
-
-        // `enclosed_name()` gives a sanitized relative Path (safe against zip-slip),
-        // skip entries that don't resolve to a safe path.
-        let Some(path) = file.enclosed_name() else {
-            continue;
-        };
-
-        let is_dir = file.is_dir();
-        drop(file); // release borrow on archive before recursing into by_index again
-
-        insert_zip_entry(&mut root, &path, origin_path, is_dir);
-    }
-
-    Ok(VFSNode::Dir(root))
-}
+//MARK: Archive VFS
 //SLOP
 // Walk the path components of a single zip entry, creating/descending into
 // VFSTree dirs as needed, then inserting the final file/dir node.\
-fn insert_zip_entry(
-    tree: &mut VFSTree,
+fn insert_archive_vfs_entry(
+    tree: &mut ArchiveVFSTree,
     path: &std::path::Path,
     origin_path: &str,
     is_dir: bool,
@@ -1764,10 +1877,10 @@ fn insert_zip_entry(
     for comp in &components[..components.len() - 1] {
         let entry = current
             .entry(comp.clone())
-            .or_insert_with(|| VFSNode::Dir(VFSTree::new()));
+            .or_insert_with(|| ArchiveVFSNode::Dir(ArchiveVFSTree::new()));
         match entry {
-            VFSNode::Dir(sub) => current = sub,
-            VFSNode::File(_) => {
+            ArchiveVFSNode::Dir(sub) => current = sub,
+            ArchiveVFSNode::File(_) => {
                 // conflict: a file exists where a dir is expected; skip or handle as needed
                 return;
             }
@@ -1777,73 +1890,40 @@ fn insert_zip_entry(
     if is_dir {
         current
             .entry(last.clone())
-            .or_insert_with(|| VFSNode::Dir(VFSTree::new()));
+            .or_insert_with(|| ArchiveVFSNode::Dir(ArchiveVFSTree::new()));
     } else {
-        let relative_path = path.to_string_lossy().to_string();
-        let node = current
+        current
             .entry(last.clone())
             .or_insert_with(|| {
-                VFSNode::File(VFSFile {
-                    paths: OrderedHashMap::new(),
-                    dltx_patches: HashMap::new(),
-                })
+                ArchiveVFSNode::File(String::new())
             });
-        if let VFSNode::File(file_data) = node {
-            file_data
-                .paths
-                .insert(origin_path.to_string(), relative_path);
-        }
     }
 }
-//MARK: ZIP Extraction
+
+//MARK: VFS Scan ZIP
 //SLOP
-//FIXME Mods: If a selected_path is in another selected_path, ignore it in the containing selected_path. 
-fn extract_dirs_from_zip(
-    archive: &mut ZipArchive<impl io::Read + io::Seek>,
-    dir_list: Vec<String>, // e.g. "some/subdir/"
-    output_root: &Path,
-) -> zip::result::ZipResult<()> {
-    for dir_prefix in dir_list {
-        // Normalize prefix to always end with '/'
-        let prefix = if dir_prefix.ends_with('/') || dir_prefix.is_empty() {
-            dir_prefix.to_string()
-        } else {
-            format!("{}/", dir_prefix)
+fn vfs_scan_zip<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    origin_path: &str, // e.g. the zip file's own path, used as the "source" key
+) -> ArchiveVFSTree {
+    let mut tree = ArchiveVFSTree::new();
+
+    for i in 0..archive.len() {
+        let file = archive.by_index(i).unwrap();
+
+        // `enclosed_name()` gives a sanitized relative Path (safe against zip-slip),
+        // skip entries that don't resolve to a safe path.
+        let Some(path) = file.enclosed_name() else {
+            continue;
         };
 
-        for i in 0..archive.len() {
-            let mut file = archive.by_index(i)?;
-            let name = file.name().to_string();
-            // Only process entries under the target directory
-            if !name.starts_with(&prefix) {
-                continue;
-            }
-            // Compute the path relative to the extracted directory
-            let relative = &name[prefix.len()..];
-            if relative.is_empty() {
-                continue; // this is the directory entry itself
-            }
-            let out_path = output_root.join(relative);
-            if file.is_dir() {
-                fs::create_dir_all(&out_path)?;
-            } else {
-                if let Some(parent) = out_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                let mut out_file = fs::File::create(&out_path)?;
-                io::copy(&mut file, &mut out_file)?;
-            }
-            // Preserve Unix permissions if available
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if let Some(mode) = file.unix_mode() {
-                    fs::set_permissions(&out_path, fs::Permissions::from_mode(mode))?;
-                }
-            }
-        }
+        let is_dir = file.is_dir();
+        drop(file); // release borrow on archive before recursing into by_index again
+
+        insert_archive_vfs_entry(&mut tree, &path, origin_path, is_dir);
     }
-    Ok(())
+
+    tree
 }
 
 //MARK: VFS Scan 7Z
@@ -1851,170 +1931,166 @@ fn extract_dirs_from_zip(
 fn vfs_scan_7z<R: Read + Seek>(
     reader: &mut R,
     origin_path: &str,
-) -> Result<VFSNode, sevenz_rust2::Error> {
-    let archive = Archive::read(reader, &Password::empty())?;
+) -> ArchiveVFSTree {
+    let archive = Archive::read(reader, &Password::empty()).unwrap();
 
-    let mut tree: VFSTree = VFSTree::new();
+    let mut tree = ArchiveVFSTree::new();
     for entry in &archive.files {
         let name = entry.name.replace('\\', "/");
         let path = std::path::Path::new(&name);
-        insert_zip_entry(&mut tree, path, origin_path, entry.is_directory);
+        insert_archive_vfs_entry(&mut tree, path, origin_path, entry.is_directory);
     }
 
-    Ok(VFSNode::Dir(tree))
-}
-
-//MARK: 7Z Extraction
-//SLOP
-//FIXME Mods: If a selected_path is in another selected_path, ignore it in the containing selected_path. 
-fn extract_dirs_from_7z(
-    mut reader: impl Read + std::io::Seek,
-    dir_list: Vec<String>,
-    output_root: &Path,
-) -> Result<(), sevenz_rust2::Error> {
-    for dir_prefix in dir_list {
-        let prefix = if dir_prefix.is_empty() {
-            String::new()
-        } else if dir_prefix.ends_with('/') {
-            dir_prefix.to_string()
-        } else {
-            format!("{}/", dir_prefix)
-        };
-
-        decompress_with_extract_fn(&mut reader, output_root, |entry: &ArchiveEntry, entry_reader: &mut dyn Read, _dest_path: &PathBuf| {
-            let name = entry.name.replace('\\', "/");
-
-            if !prefix.is_empty() && (!name.starts_with(&prefix) || name.len() == prefix.len()) {
-                return Ok(false); // not under target dir, or is the dir entry itself
-            }
-
-            let relative = if prefix.is_empty() { name.as_str() } else { &name[prefix.len()..] };
-            let out_path = output_root.join(relative);
-
-            if entry.is_directory {
-                fs::create_dir_all(&out_path)?;
-            } else {
-                if let Some(parent) = out_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                let mut out_file = fs::File::create(&out_path)?;
-                io::copy(entry_reader, &mut out_file)?;
-            }
-
-            Ok(false) // we wrote it ourselves — tell the library not to also extract it
-        })?;
-    }
-    Ok(())
+    tree
 }
 
 //MARK: VFS Scan RAR
 //SLOP
-fn vfs_scan_rar(archive_path: &Path, origin_path: &str) -> VFSNode {
-    let mut tree: VFSTree = VFSTree::new();
+fn vfs_scan_rar(archive_path: &Path, origin_path: &str) -> ArchiveVFSTree {
+    let mut tree = ArchiveVFSTree::new();
 
     for entry in unrar::Archive::new(archive_path).open_for_listing().unwrap() {
         let entry = entry.unwrap();
         let name = entry.filename.to_string_lossy().replace('\\', "/");
-        insert_zip_entry(&mut tree, Path::new(&name), origin_path, entry.is_directory());
+        insert_archive_vfs_entry(&mut tree, Path::new(&name), origin_path, entry.is_directory());
     }
 
-    VFSNode::Dir(tree)
+    tree
+}
+//MARK: Archive Extract
+
+struct ArchiveEntry {
+    path: PathBuf,
+    is_dir: bool,
 }
 
-//MARK: RAR extraction
 //SLOP
-//FIXME Mods: If a selected_path is in another selected_path, ignore it in the containing selected_path. 
-fn extract_dirs_from_rar(
-    archive_path: &Path,
-    dir_list: Vec<String>,
-    output_root: &Path,
-) -> unrar::error::UnrarResult<()> {
-    for dir_prefix in dir_list {
-        let prefix = if dir_prefix.is_empty() {
-            String::new()
-        } else if dir_prefix.ends_with('/') {
-            dir_prefix.to_string()
+fn resolve_relative_path(
+    file_path: &Path,
+    root_list: &[String],
+    remove_list: &[String],
+) -> Option<PathBuf> {
+    let file_path_str = file_path.to_string_lossy().to_string();
+
+    if parent_in_tf_list(&file_path_str, remove_list.to_vec(), root_list.to_vec()) != (true, true) {
+        return None;
+    }
+
+    let matched_root = root_list
+        .iter()
+        .filter(|r| !r.is_empty() && file_path.starts_with(r.as_str()))
+        .max_by_key(|r| r.len());
+
+    match matched_root {
+        Some(root) => Some(file_path.strip_prefix(root).unwrap().to_path_buf()),
+        None if root_list.iter().any(|r| r.is_empty()) => Some(file_path.to_path_buf()),
+        None => None,
+    }
+}
+
+//SLOP
+fn write_entry(target_path: &Path, relative_path: &Path, is_dir: bool, data: Option<&[u8]>) {
+    let out_path = target_path.join(relative_path);
+    if is_dir {
+        std::fs::create_dir_all(&out_path).unwrap();
+    } else {
+        if let Some(parent) = out_path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&out_path, data.unwrap()).unwrap();
+    }
+}
+
+//MARK: Archive Extract ZIP
+//SLOP
+fn archive_extract_zip(archive_path: PathBuf, target_path: PathBuf, root_list: Vec<String>, remove_list: Vec<String>) {
+    let archive_file = File::open(archive_path).unwrap();
+    let mut archive = zip::ZipArchive::new(archive_file).unwrap();
+    for i in 0..archive.len() {
+        let mut file = archive.by_index(i).unwrap();
+        let Some(file_path) = file.enclosed_name() else { continue };
+        let Some(relative_path) = resolve_relative_path(&file_path, &root_list, &remove_list) else { continue };
+
+        if file.is_dir() {
+            write_entry(&target_path, &relative_path, true, None);
         } else {
-            format!("{}/", dir_prefix)
-        };
-
-        let mut archive = unrar::Archive::new(archive_path).open_for_processing()?;
-
-        while let Some(cursor) = archive.read_header()? {
-            let entry = cursor.entry();
-            let name = entry.filename.to_string_lossy().replace('\\', "/");
-
-            let matches = prefix.is_empty()
-                || (name.starts_with(&prefix) && name.len() > prefix.len());
-
-            if matches && !entry.is_directory() {
-                let relative = if prefix.is_empty() { name.as_str() } else { &name[prefix.len()..] };
-                let out_path = output_root.join(relative);
-                if let Some(parent) = out_path.parent() {
-                    fs::create_dir_all(parent).expect("Couldn't create directory");
-                }
-
-                let (data, rest) = cursor.read()?;
-                fs::write(&out_path, data).expect("Couldn't write file");
-                archive = rest;
-            } else if matches && entry.is_directory() {
-                let relative = if prefix.is_empty() { name.as_str() } else { &name[prefix.len()..] };
-                if !relative.is_empty() {
-                    fs::create_dir_all(output_root.join(relative)).expect("Couldn't create directory");
-                }
-                archive = cursor.skip()?;
-            } else {
-                archive = cursor.skip()?;
-            }
+            let mut buf = Vec::new();
+            std::io::copy(&mut file, &mut buf).unwrap();
+            write_entry(&target_path, &relative_path, false, Some(&buf));
         }
     }
-    Ok(())
 }
 
-//MARK: Organize Sorting
-fn sort_organize_data(orderdata: Value, organizesort: OrganizeSort) -> Vec<OrganizeSortListEntry> {
-    let mut orderdata_array = orderdata.as_array().cloned().unwrap_or_else(Vec::new);
-    let mut organizesortlist = Vec::new();
-    //Add priority field
-    for (i, item) in orderdata_array.iter_mut().enumerate() {
-        organizesortlist.push(OrganizeSortListEntry {
-            enabled: item
-                .get("enabled")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            name: item
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            category: item
-                .get("category")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            version: item
-                .get("version")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-            priority: i as i64,
-            path: item
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string(),
-        });
-    }
-    match organizesort {
-        OrganizeSort::NameAsc => organizesortlist.par_sort_by(|a, b| a.name.cmp(&b.name)),
-        OrganizeSort::NameDesc => organizesortlist.par_sort_by(|a, b| b.name.cmp(&a.name)),
-        OrganizeSort::CategoryAsc => organizesortlist.par_sort_by(|a, b| a.category.cmp(&b.category)),
-        OrganizeSort::CategoryDesc => organizesortlist.par_sort_by(|a, b| b.category.cmp(&a.category)),
-        OrganizeSort::PriorityAsc => organizesortlist.par_sort_by_key(|a| a.priority),
-        OrganizeSort::PriorityDesc => organizesortlist.par_sort_by_key(|b| std::cmp::Reverse(b.priority)),
-    }
-    organizesortlist
+//MARK: Archive Extract 7Z
+//SLOP
+fn archive_extract_7z(archive_path: PathBuf, target_path: PathBuf, root_list: Vec<String>, remove_list: Vec<String>) {
+    sevenz_rust2::decompress_file_with_extract_fn(
+        &archive_path,
+        &target_path,
+        |entry: &sevenz_rust2::ArchiveEntry, reader: &mut dyn std::io::Read, _default_dest: &PathBuf| {
+            let file_path = PathBuf::from(entry.name());
+
+            let Some(relative_path) = resolve_relative_path(&file_path, &root_list, &remove_list) else {
+                return Ok(false); // skip this entry
+            };
+
+            let out_path = target_path.join(&relative_path);
+
+            if entry.is_directory() {
+                std::fs::create_dir_all(&out_path).unwrap();
+            } else {
+                if let Some(parent) = out_path.parent() {
+                    std::fs::create_dir_all(parent).unwrap();
+                }
+                let mut buf = Vec::new();
+                std::io::copy(reader, &mut buf).unwrap();
+                std::fs::write(&out_path, &buf).unwrap();
+            }
+
+            Ok(false) // we already wrote it ourselves; tell the crate not to also write to its default dest
+        },
+    ).unwrap();
 }
+
+//MARK: Archive Extract RAR
+//SLOP
+fn archive_extract_rar(archive_path: PathBuf, target_path: PathBuf, root_list: Vec<String>, remove_list: Vec<String>) {
+    let mut archive = unrar::Archive::new(&archive_path)
+        .open_for_processing()
+        .unwrap();
+
+    loop {
+        let Some(header_archive) = archive.read_header().unwrap() else {
+            break; // end of archive
+        };
+
+        let entry = header_archive.entry();
+        let file_path = entry.filename.clone();
+        let is_directory = entry.is_directory();
+
+        let relative_path = resolve_relative_path(&file_path, &root_list, &remove_list);
+
+        archive = match relative_path {
+            None => header_archive.skip().unwrap(),
+            Some(rel) => {
+                if is_directory {
+                    let out_path = target_path.join(&rel);
+                    std::fs::create_dir_all(&out_path).unwrap();
+                    header_archive.skip().unwrap()
+                } else {
+                    let (data, rest) = header_archive.read().unwrap();
+                    let out_path = target_path.join(&rel);
+                    if let Some(parent) = out_path.parent() {
+                        std::fs::create_dir_all(parent).unwrap();
+                    }
+                    std::fs::write(&out_path, &data).unwrap();
+                    rest
+                }
+            }
+        };
+    }
+}
+
 
 //MARK: Tools
 fn pathdiff(path: &str, reference: &str) -> String {
@@ -2094,10 +2170,30 @@ pub fn parse_archive_name(stem: &str) -> (String, String) {
         }
     }
     let date_str = Local::now().format("%-m/%-d/%y").to_string();
-    (clean_name(stem), String::new())
+    (clean_name(stem), date_str)
 }
 //SLOP
 fn clean_name(s: &str) -> String {
     let s = Regex::new(r"[._-]+").unwrap().replace_all(s, " ");
     Regex::new(r"\s+").unwrap().replace_all(s.trim(), " ").trim().to_string()
+}
+
+//SLOP
+fn parent_in_tf_list(search: &str, false_list: Vec<String>, true_list: Vec<String>) -> (bool, bool) {
+    let mut current = Path::new(search);
+
+    while let Some(parent) = current.parent() {
+        if true_list.par_iter().any(|p| p == &parent.to_string_lossy().to_string()) {
+            return (true, true);
+        }
+        if false_list.par_iter().any(|p| p == &parent.to_string_lossy().to_string()) {
+            return (true, false);
+        }
+        if parent.as_os_str().is_empty() {
+            break;
+        }
+        current = parent;
+    }
+
+    (false, false)
 }
