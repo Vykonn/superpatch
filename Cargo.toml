@@ -6,7 +6,8 @@ edition = "2024"
 [dependencies]
 chrono = "0.4.45"
 eframe = "0.35.0"
-egui_extras = "0.35.0"
+egui_extras = { version = "0.35.0", features = ["all_loaders"] }
+image = { version = "0.25.10", features = ["jpeg", "png"] }
 native-dialog = "0.9.7"
 open = "5.3.6"
 ordered_hash_map = "0.6.0"
@@ -17,6 +18,7 @@ serde_json = "1.0.150"
 sevenz-rust2 = "0.21.3"
 sysinfo = "0.39.6"
 unrar = "0.5.8"
+xmloxide = "0.4.3"
 zip = "8.6.0"
 
 [profile.release]

@@ -1,5 +1,5 @@
 use chrono::Local;
-use eframe::egui::{self, Id, Modal};
+use eframe::egui::{self, Id, Modal, RichText, Vec2};
 use egui_extras::{Column, TableBuilder};
 use native_dialog::DialogBuilder;
 use ordered_hash_map::OrderedHashMap;
@@ -8,12 +8,14 @@ use rayon::slice::ParallelSliceMut;
 use regex::Regex;
 use serde_json::{Value, json};
 use sevenz_rust2::{Archive, Password};
+use xmloxide::{Document, NodeId};
+use xmloxide::xpath::evaluate;
 use zip::ZipArchive;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, Read, Seek};
 use std::sync::{Arc, Mutex};
-use std::{fs, thread};
+use std::{env, fs, thread};
 use std::path::Path;
 use std::{
     collections::{BTreeMap, HashMap},
@@ -154,16 +156,17 @@ enum InstallModalType {
 #[derive(Clone, PartialEq)]
 enum InstallModalInputData {
     None,
-    Manual(ManualInstallData)
+    Manual(ManualInstallData),
+    Wizard(WizardInstallData)
 }
 
 #[derive(Clone, PartialEq)]
 struct ManualInstallData {
     display_path: String,
     display_list: Vec<ManualInstallEntry>,
-    //Don't include it in roots. Extract contents as a root.
-    root_list: Vec<String>,
-    //Don't include it roots.
+    //Don't include it in roots. Extract contents as a root. Second string is relative target path. (optional)
+    root_list: Vec<(String,String)>,
+    //Don't include it in roots.
     remove_list: Vec<String>
 }
 #[derive(Clone, PartialEq)]
@@ -186,9 +189,95 @@ enum ManualInstallEntryState {
     //This is not in any list, but its parent is in the remove_list.
     ProxyRemove
 }
+//This implementation of FOMOD does not include file, game, or fomm dependencies. Flag deps only. Everything else SHOULD be functionally identical.
+#[derive(Clone, PartialEq)]
+struct WizardInstallData {
+    //usize is priority
+    init_roots: Vec<(String, String, usize)>,
+    pages: Vec<WizardPage>,
+    name: String,
+    version: String,
+    website: String,
+    image: PathBuf,
+    //It's NOT this simple. Because of page visibility.
+    //Current concept: Vec<usize>.
+    //[0, 1, 2, 3, 5, -1]
+    //^past current^  ^next(-1 means end)
+    //To go back, remove last entry.
+    //To go forward, calculate next next page flags, and add it to the list. -1 if end.
+    //Upon any option changing, calculate next page flags.
+    track: Vec<i32>,
+    //Current group, current otion
+    display: (usize, usize)
+}
+#[derive(Clone,PartialEq)]
+struct WizardPage {
+    groups: Vec<WizardGroup>,
+    name: String,
+    aff_com: CompositeDependency,
+}
+#[derive(Clone, PartialEq)]
+struct WizardGroup {
+    options: Vec<WizardOption>,
+    name: String,
+    group_type: WizardGroupType,
+}
+#[derive(Clone, PartialEq)]
+struct WizardOption {
+    name: String,
+    description: String,
+    //path to temp path for image
+    image: PathBuf,
+    //usize is priority
+    roots: Vec<(String, String, usize)>,
+    roots_always: Vec<(String, String, usize)>,
+    roots_available: Vec<(String, String, usize)>,
+    //LIVE
+    selected: bool,
+    default_type: OptionAffectType,
+    aff_data: Vec<OptionAffectData>,
+    eff_flags: Vec<(String, String)>,
+    //LIVE: Selectable? Calculated by comparison on aff_flags w/ previous eff_flags
+    active_type: OptionAffectType
+}
+#[derive(Clone, PartialEq)]
+enum WizardGroupType {
+    All,
+    AtMostOne,
+    Any,
+    ExactlyOne,
+    AtLeastOne
+}
+#[derive(Clone, PartialEq)]
+enum OptionAffectType {
+    Required,
+    Allowed,
+    Disallowed
+}
+#[derive(Clone, PartialEq)]
+enum AffectOperator {
+    And,
+    Or
+}
+#[derive(Clone, PartialEq)]
+struct OptionAffectData {
+    aff_type: OptionAffectType,
+    aff_com: CompositeDependency
+}
+#[derive(Clone, PartialEq)]
+struct CompositeDependency {
+    aff_flags: Vec<DependencyTypesGroup>,
+    aff_op: AffectOperator
+}
+#[derive(Clone, PartialEq)]
+enum DependencyTypesGroup {
+    Flag(String, String),
+    CompositeDependency(CompositeDependency)
+}
+
 #[derive(Clone)]
 struct InstallModalInstallData {
-    root_list: Vec<String>,
+    root_list: Vec<(String, String)>,
     remove_list: Vec<String>,
     copy_archive: bool,
     delete_archive: bool,
@@ -204,6 +293,12 @@ enum SpecificIndexTarget {
     Last,
     Replace,
     Before
+}
+#[derive(Clone, PartialEq)]
+enum ExtensionType {
+    Zip,
+    Rar,
+    SevenZ
 }
 
 impl SuperPatchApp {
@@ -284,11 +379,11 @@ impl SuperPatchApp {
         //Make VFS data for mod from archive.
         let ext = self.livedata.install_modal_path.extension().unwrap();
         let extension_type = if ext == OsStr::new("zip") {
-            "zip"
+            ExtensionType::Zip
         } else if ext == OsStr::new("rar") {
-            "rar"
+            ExtensionType::Rar
         } else if ext == OsStr::new("7z") || ext == OsStr::new("7zip") {
-            "7z"
+            ExtensionType::SevenZ
         } else {
             *self.status.lock().unwrap() = "Invalid file extension".to_string();
             self.livedata.install_modal_open = false;
@@ -298,24 +393,28 @@ impl SuperPatchApp {
         };
         let mut file = std::fs::File::open(&self.livedata.install_modal_path).unwrap();
         self.livedata.install_modal_vfs_data = match extension_type {
-            "zip" => {
+            ExtensionType::Zip => {
                 let mut archive = zip::ZipArchive::new(file).unwrap();
                 Some(vfs_scan_zip(&mut archive, self.livedata.install_modal_path.to_str().unwrap()))
             },
-            "rar" => {
+            ExtensionType::Rar => {
                 Some(vfs_scan_rar(&self.livedata.install_modal_path, self.livedata.install_modal_path.to_str().unwrap()))
             },
-            "7z" => {
+            ExtensionType::SevenZ => {
                 Some(vfs_scan_7z(&mut file, self.livedata.install_modal_path.to_str().unwrap()))
-            },
-            _ => panic!()
+            }
         };
     }
     fn check_mod_type(&mut self) {
-        //TODO Mods: Detect selectors and wizards.
+        //TODO Mods: Detect selectors and skips
 
-        //FOMOD wizard (https://nexus-mods.github.io/NexusMods.App/developers/misc/AboutFomod/) (https://stepmodifications.org/wiki/Guide:FOMOD)
-
+        //CURRENT: Allow fomod in other root (suprisingly difficult!)
+        //Need to change ALL the paths. (fixed extracts, image extracts, file extracts.)
+        //Might be easier to add as a input to extract fn.
+        if self.livedata.install_modal_vfs_data.as_ref().unwrap().contains_key("fomod") {
+            self.livedata.install_modal_type = InstallModalType::Wizard;
+            return;
+        }
         //One root, skip
 
         //Multiple roots, selector
@@ -363,7 +462,7 @@ impl SuperPatchApp {
                 state: ManualInstallEntryState::None,
             };
             new_entry.state =
-                if data.root_list.par_iter().any(|e| e == &full_path) {ManualInstallEntryState::Root}
+                if data.root_list.par_iter().any(|e| e.0 == full_path) {ManualInstallEntryState::Root}
                 else if data.remove_list.par_iter().any(|e| e == &full_path) {ManualInstallEntryState::Remove}
                 else {
                     let test = parent_in_tf_list(&full_path, data.remove_list.clone(), data.root_list.clone());
@@ -377,21 +476,169 @@ impl SuperPatchApp {
         };
         self.livedata.install_modal_input_data = InstallModalInputData::Manual(data)
     }
+    fn install_modal_create_input_data_wizard(&mut self) {
+        //FOMOD data (https://stepmodifications.org/wiki/Guide:FOMOD) (https://fomod-docs.readthedocs.io/en/latest/specs.html)
+        let fomod_vfs = match self.livedata.install_modal_vfs_data.as_ref().unwrap().get_key_value("fomod").unwrap().1 {
+            ArchiveVFSNode::Dir(data) => data,
+            _ => panic!()
+        };
+        let extension_type = check_extension_type(self.livedata.install_modal_path.clone());
+        //Extract ModuleConfig.xml
+        let temp_dir = env::temp_dir().join(self.livedata.install_modal_path.file_stem().unwrap());
+        if temp_dir.is_dir() {
+            fs::remove_dir_all(&temp_dir).unwrap();
+        }
+        fs::create_dir(&temp_dir).unwrap();
+        archive_extract_univ(extension_type.clone(), self.livedata.install_modal_path.clone(), temp_dir.clone(), vec![("fomod/ModuleConfig.xml".to_string(), String::new())], Vec::new());
+        let mod_xml = Document::parse_file(temp_dir.join("ModuleConfig.xml")).unwrap();
+        let root = mod_xml.root_element().unwrap();
+        let mut name = String::new();
+        let mut website = String::new();
+        let mut version = String::new();
+        let info_exists = fomod_vfs.contains_key("info.xml");
+        if info_exists {
+            archive_extract_univ(extension_type.clone(), self.livedata.install_modal_path.clone(), temp_dir.clone(), vec![("fomod/info.xml".to_string(), String::new())], Vec::new());
+            //Get name, version & website from info.xml
+            let info_xml = Document::parse_file(temp_dir.join("info.xml")).unwrap();
+            let root = info_xml.root_element().unwrap();
+            name = evaluate(&info_xml, root, "string(Name)").unwrap().to_string();
+            website = evaluate(&info_xml, root, "string(Website)").unwrap().to_string();
+            version = evaluate(&info_xml, root, "string(Version)").unwrap().to_string();
+        }
+        else {
+            let module_name = evaluate(&mod_xml, root, "string(moduleName)").unwrap().to_string();
+            (name, version) = parse_archive_name(&module_name);
+        }
+        //Get image from ModuleConfig.xml
+        let mut image_roots = Vec::<(String, String)>::new();
+        let image_original = evaluate(&mod_xml, root, "string(moduleImage/@path)").unwrap().to_string();
+        let image = if !image_original.is_empty() {
+            image_roots.push((image_original.clone(), String::new()));
+            temp_dir.join(Path::new(&normalize_sep(&image_original)).file_name().unwrap())
+        } else {
+            Path::new("").to_path_buf()
+        };
+        //Load init_roots from ModuleConfig.xml
+        let required_install = evaluate(&mod_xml, root, "requiredInstallFiles").unwrap().as_node_set().and_then(|nodes| nodes.first().copied());
+        let init_roots = match required_install {
+            Some(required_install) => {parse_file_list_flat(&mod_xml, required_install)}
+            None => Vec::new()
+        };
+        let mut pages = Vec::new();
+        let install_steps_eval = evaluate(&mod_xml, root, "installSteps/installStep").unwrap();
+        let install_steps = install_steps_eval.as_node_set();
+        match install_steps {
+            Some(install_steps) => {
+                for install_step in install_steps {
+                    let mut groups = Vec::new();
+                    let group_list_eval = evaluate(&mod_xml, *install_step, "optionalFileGroups/group").unwrap();
+                    let group_list = group_list_eval.as_node_set();
+                    match group_list {
+                        Some(group_list) => {
+                            for group in group_list {
+                                let mut options = Vec::new();
+                                let options_list_eval = evaluate(&mod_xml, *group, "plugins/plugin").unwrap();
+                                let options_list = options_list_eval.as_node_set();
+                                match options_list {
+                                    Some(options_list) => {
+                                        for option in options_list {
+                                            let install_files = evaluate(&mod_xml, *option, "files").unwrap().as_node_set().and_then(|nodes| nodes.first().copied());
+                                            let dependency_group_eval = evaluate(&mod_xml, *option, "ConditionFlags/dependencyTypesGroup").unwrap();
+                                            let dependency_group = dependency_group_eval.as_node_set();
+                                            let eff_flags = match dependency_group {
+                                                Some(dependency_group) => {parse_flags(&mod_xml, dependency_group)},
+                                                None => Vec::new()
+                                            };
+                                            let mut aff_data = Vec::new();
+                                            let pattern_list_eval = evaluate(&mod_xml, *option, "typeDescriptor/dependencyType/patterns/pattern").unwrap();
+                                            let pattern_list = pattern_list_eval.as_node_set();
+                                            if let Some(pattern_list) = pattern_list {
+                                                for pattern in pattern_list {
+                                                let dependency_group = evaluate(&mod_xml, *pattern, "dependencies").unwrap().as_node_set().and_then(|nodes| nodes.first().copied());
+                                                let aff_com = match dependency_group {
+                                                    Some(dependency_group) => {parse_composite_deps(&mod_xml, dependency_group)},
+                                                    None => CompositeDependency { aff_flags: Vec::new(), aff_op: AffectOperator::And }
+                                                };
+                                                let aff_type_eval = evaluate(&mod_xml, *pattern, "@type").unwrap().to_string();
+                                                let aff_type = match aff_type_eval.as_str() {
+                                                    "Required" => OptionAffectType::Required,
+                                                    "Optional" => OptionAffectType::Allowed,
+                                                    "Recommended" => OptionAffectType::Allowed,
+                                                    "NotUsable" => OptionAffectType::Disallowed,
+                                                    "CouldBeUsable" => OptionAffectType::Allowed,
+                                                    other => panic!("Unknown type when required: {}", other)
+                                                };
+                                                let pattern = OptionAffectData {aff_com, aff_type};
+                                                aff_data.push(pattern);
+                                                }
+                                            }
+                                            let (roots, roots_always, roots_available) = match install_files {
+                                                Some(install_files) => {parse_file_list(&mod_xml, install_files)},
+                                                None => {(Vec::new(), Vec::new(), Vec::new())}
+                                            };
+                                            let default_type_eval = evaluate(&mod_xml, *option, "string(typeDescriptor/dependencyType/defaultType/@name)").unwrap().to_string();
+                                            let default_type = match default_type_eval.as_str() {
+                                                "Required" => OptionAffectType::Required,
+                                                "Optional" => OptionAffectType::Allowed,
+                                                "Recommended" => OptionAffectType::Allowed,
+                                                "NotUsable" => OptionAffectType::Disallowed,
+                                                "CouldBeUsable" => OptionAffectType::Allowed,
+                                                other => {println!("Unknown type: {}", other);OptionAffectType::Allowed}
+                                            };
+                                            let name = evaluate(&mod_xml, *option, "string(@name)").unwrap().to_string();
+                                            let description = evaluate(&mod_xml, *option, "string(description)").unwrap().to_string();
+                                            let image_original = evaluate(&mod_xml, *option, "string(image/@path)").unwrap().to_string();
+                                            let image = if !image_original.is_empty() {
+                                                image_roots.push((image_original.clone(), String::new()));
+                                                temp_dir.join(Path::new(&normalize_sep(&image_original)).file_name().unwrap())
+                                            } else {
+                                                Path::new("").to_path_buf()
+                                            };
+                                            let option = WizardOption {name, description, image, roots, roots_always, roots_available, selected: false, default_type, aff_data, eff_flags, active_type: OptionAffectType::Allowed};
+                                            options.push(option);
+                                        }
+                                    },
+                                    None => panic!("No options!")
+                                }
+                                let name = evaluate(&mod_xml, *group, "string(@name)").unwrap().to_string();
+                                let group_type_eval =  evaluate(&mod_xml, *group, "string(@type)").unwrap().to_string();
+                                let group_type = match group_type_eval.as_str() {
+                                    "SelectAtLeastOne" => WizardGroupType::AtLeastOne,
+                                    "SelectAtMostOne" => WizardGroupType::AtMostOne,
+                                    "SelectExactlyOne" => WizardGroupType::ExactlyOne,
+                                    "SelectAll" => WizardGroupType::All,
+                                    "SelectAny" => WizardGroupType::Any,
+                                    other => panic!("Unknown type when required: {}", other)
+                                };
+                                let group = WizardGroup {options, name, group_type};
+                                groups.push(group);
+                            }
+                        },
+                        None => panic!("No groups!")
+                    }
+                    let name = evaluate(&mod_xml, *install_step, "string(@name)").unwrap().to_string();
+                    let dependency_group = evaluate(&mod_xml, *install_step, "visible/dependencyTypesGroup").unwrap().as_node_set().and_then(|nodes| nodes.first().copied());
+                    let aff_com = match dependency_group {
+                        Some(dependency_group) => {parse_composite_deps(&mod_xml, dependency_group)},
+                        None => CompositeDependency { aff_flags: Vec::new(), aff_op: AffectOperator::And }
+                    };
+                    let page = WizardPage {groups, name, aff_com};
+                    pages.push(page);
+                }
+            }
+            None => panic!("No Pages!")
+        }
+        archive_extract_univ(extension_type.clone(), self.livedata.install_modal_path.clone(), temp_dir.clone(), image_roots, Vec::new());
+        let mut data =  WizardInstallData {init_roots, pages, name, version, website, image, track: vec![0,-2], display: (0,0)};
+        calculate_flags(&mut data, false);
+        self.livedata.install_modal_input_data = InstallModalInputData::Wizard(data);
+    }
     fn install_mod(&mut self) {
         let install_data = match &self.livedata.install_modal_install_data {
             Some(install_data) => install_data,
             _ => panic!()
         };
-        let ext = self.livedata.install_modal_path.extension().unwrap();
-        let extension_type = if ext == OsStr::new("zip") {
-            "zip"
-        } else if ext == OsStr::new("rar") {
-            "rar"
-        } else if ext == OsStr::new("7z") || ext == OsStr::new("7zip") {
-            "7z"
-        } else {
-            panic!()
-        };
+        let extension_type = check_extension_type(self.livedata.install_modal_path.clone());
         if !Path::exists(Path::new("mods")) {
             fs::create_dir("mods").expect("Failed to create configs directory")
         }
@@ -407,18 +654,7 @@ impl SuperPatchApp {
             }
         }
         let target_path = Path::new("mods").join(install_data.name.clone());
-        match extension_type {
-            "zip" => {
-                archive_extract_zip(self.livedata.install_modal_path.clone(), target_path.clone(), install_data.root_list.clone(), install_data.remove_list.clone());
-            },
-            "rar" => {
-                archive_extract_rar(self.livedata.install_modal_path.clone(), target_path.clone(), install_data.root_list.clone(), install_data.remove_list.clone());
-            },
-            "7z" => {
-                archive_extract_7z(self.livedata.install_modal_path.clone(), target_path.clone(), install_data.root_list.clone(), install_data.remove_list.clone());
-            },
-            _ => panic!()
-        }
+        archive_extract_univ(extension_type, self.livedata.install_modal_path.clone(), target_path.clone(), install_data.root_list.clone(), install_data.remove_list.clone());
         let mut archive_path = String::new();
         if install_data.copy_archive {
             if !Path::exists(Path::new("archives")) {
@@ -456,6 +692,7 @@ impl SuperPatchApp {
         if install_data.delete_archive {
             fs::remove_file(self.livedata.install_modal_path.clone()).expect("Failed to delete archive");
         }
+        //TODO Mods: Save root_list and remove_list for modpack use.
         let entry = json!({
             "enabled": true,
             "name": install_data.name,
@@ -538,6 +775,7 @@ impl SuperPatchApp {
             .replace("%path%", real_vfs_path.to_str().unwrap_or(""));
         *status.lock().unwrap() = "Launching game.".to_string();
         //TODO Launch: Display error message if the command fails to launch the game.
+        //TODO Launch: This won't work on windows.
         let _ = Command::new("sh")
             .arg("-c")
             .arg(game_command)
@@ -662,17 +900,18 @@ impl eframe::App for SuperPatchApp {
                     if self.livedata.install_modal_input_data == InstallModalInputData::None {
                         match self.livedata.install_modal_type {
                             InstallModalType::Manual => {self.install_modal_update_input_data_manual()}
+                            InstallModalType::Wizard => {self.install_modal_create_input_data_wizard()}
                             _ => panic!()
                         }
                     }
                     if self.livedata.install_modal_install_data.is_none() {
-                        let input_data = match &mut self.livedata.install_modal_input_data {
-                            InstallModalInputData::Manual(sortdata) => sortdata,
-                            _ => panic!()
-                        };
                         match self.livedata.install_modal_type {
                             //MARK: Manual Installation
                             InstallModalType::Manual => {
+                                let input_data = match &mut self.livedata.install_modal_input_data {
+                                    InstallModalInputData::Manual(data) => data,
+                                    _ => panic!()
+                                };
                                 let mut needs_update = false;
                                 ui.label("Mod type not detected. Please manually select files.");
                                 //TODO Mods: Top 10 Puzzles of all time
@@ -681,16 +920,16 @@ impl eframe::App for SuperPatchApp {
                                 ui.vertical(|ui| { 
                                     if input_data.display_path.is_empty() {
                                         ui.horizontal(|ui| {
-                                            if input_data.root_list.par_iter().any(|x| x.is_empty()) {
+                                            if input_data.root_list.par_iter().any(|x| x.0.is_empty()) {
                                                 ui.add_enabled(false, egui::Button::new("N"));
                                                 if ui.button("X").clicked() {
-                                                    input_data.root_list.retain(|x| !x.is_empty());
+                                                    input_data.root_list.retain(|x| !x.0.is_empty());
                                                     needs_update = true;
                                                 }
                                                 ui.label("R");
                                             } else {
                                                 if ui.button("R").clicked() {
-                                                    input_data.root_list.push("".to_string());
+                                                    input_data.root_list.push((String::new(), String::new()));
                                                     needs_update = true;
                                                 }
                                                 ui.add_enabled(false, egui::Button::new("N"));
@@ -708,11 +947,11 @@ impl eframe::App for SuperPatchApp {
                                             match entry.state {
                                                 ManualInstallEntryState::Root => {
                                                     if ui.button("=").clicked() {
-                                                        input_data.root_list.retain(|x| x != &entry.path.clone());
+                                                        input_data.root_list.retain(|x| x.0 != entry.path.clone());
                                                         needs_update = true;
                                                     }
                                                     if ui.button("X").clicked() {
-                                                        input_data.root_list.retain(|x| x != &entry.path.clone());
+                                                        input_data.root_list.retain(|x| x.0 != entry.path.clone());
                                                         input_data.remove_list.push(entry.path.clone());
                                                         needs_update = true;
                                                     }
@@ -721,7 +960,7 @@ impl eframe::App for SuperPatchApp {
                                                 ManualInstallEntryState::Remove => {
                                                     if ui.button("R").clicked() {
                                                         input_data.remove_list.retain(|x| x != &entry.path.clone());
-                                                        input_data.root_list.push(entry.path.clone());
+                                                        input_data.root_list.push((entry.path.clone(), String::new()));
                                                         needs_update = true;
                                                     }
                                                     if ui.button("=").clicked() {
@@ -732,7 +971,7 @@ impl eframe::App for SuperPatchApp {
                                                 }
                                                 ManualInstallEntryState::ProxyRoot => {
                                                     if ui.button("R").clicked() {
-                                                        input_data.root_list.push(entry.path.clone());
+                                                        input_data.root_list.push((entry.path.clone(), String::new()));
                                                         needs_update = true;
                                                     }
                                                     if ui.button("X").clicked() {
@@ -743,7 +982,7 @@ impl eframe::App for SuperPatchApp {
                                                 }
                                                 ManualInstallEntryState::ProxyRemove => {
                                                     if ui.button("R").clicked() {
-                                                        input_data.root_list.push(entry.path.clone());
+                                                        input_data.root_list.push((entry.path.clone(), String::new()));
                                                         needs_update = true;
                                                     }
                                                     ui.add_enabled(false, egui::Button::new("N"));
@@ -751,7 +990,7 @@ impl eframe::App for SuperPatchApp {
                                                 }
                                                 ManualInstallEntryState::None => {
                                                     if ui.button("R").clicked() {
-                                                        input_data.root_list.push(entry.path.clone());
+                                                        input_data.root_list.push((entry.path.clone(), String::new()));
                                                         needs_update = true;
                                                     }
                                                     ui.add_enabled(false, egui::Button::new("N"));
@@ -781,7 +1020,106 @@ impl eframe::App for SuperPatchApp {
                                     self.install_modal_update_input_data_manual();
                                 }
                             },
-                            //TODO Mods: Implement selectors and wizards
+                            //MARK: Wizard Installation
+                            InstallModalType::Wizard => {
+                                let input_data = match &mut self.livedata.install_modal_input_data {
+                                    InstallModalInputData::Wizard(data) => data,
+                                    _ => panic!()
+                                };
+                                let page_index = input_data.track[input_data.track.len()-2] as usize;
+                                ui.label(input_data.pages[page_index].name.clone());
+                                ui.separator();
+                                //CURRENT: Wizard body
+                                ui.horizontal(|ui| {
+                                    ui.vertical(|ui| {
+                                        let image = input_data.pages[page_index].groups[input_data.display.0].options[input_data.display.1].image.clone();
+                                        let image_source = if !image.as_os_str().is_empty() {
+                                            egui::ImageSource::from(format!("file://{}", normalize_sep(&image.to_string_lossy())))
+                                        } else {
+                                            let image = input_data.image.clone();
+                                            if !image.as_os_str().is_empty() {
+                                                egui::ImageSource::from(format!("file://{}", normalize_sep(&image.to_string_lossy())))
+                                            } else {
+                                                egui::include_image!("../assets/placeholder.png")
+                                            }
+                                        };
+                                        ui.add_sized(Vec2 {x: 250.0, y: 250.0}, egui::Image::new(image_source).fit_to_exact_size(Vec2 { x: 250.0, y: 250.0 }).max_size(Vec2{x: 250.0, y: 250.0}));
+                                        egui::ScrollArea::vertical().max_width(250.0).min_scrolled_height(250.0).auto_shrink(false).max_height(250.0).show(ui, |ui| {
+                                            ui.label(input_data.pages[page_index].groups[input_data.display.0].options[input_data.display.1].description.clone())
+                                        });
+                                    });
+                                    ui.separator();
+                                    egui::ScrollArea::vertical().max_width(250.0).auto_shrink(false).show(ui, |ui| {
+                                        ui.vertical(|ui| {
+                                            for (gi, group) in &mut input_data.pages[page_index].groups.iter().enumerate() {
+                                                ui.horizontal(|ui| {
+                                                    ui.label(group.name.clone());
+                                                    ui.add(egui::Separator::default().horizontal())
+                                                });
+                                                let group_type = group.group_type.clone();
+                                                let group_type_label = match group_type {
+                                                    WizardGroupType::All => "Select All",
+                                                    WizardGroupType::Any => "Select Any",
+                                                    WizardGroupType::AtLeastOne => "Select at least one",
+                                                    WizardGroupType::ExactlyOne => "Select exactly one",
+                                                    WizardGroupType::AtMostOne => "Select at most one"
+                                                };
+                                                ui.label(RichText::new(group_type_label).small());
+                                                for (oi, option) in &mut group.options.iter().enumerate() {
+                                                    ui.horizontal(|ui| {
+                                                        let enabled = if option.active_type == OptionAffectType::Allowed {
+                                                            true
+                                                        } else {
+                                                            false
+                                                        };
+                                                        let mut selected = option.selected.clone();
+                                                        if group_type == WizardGroupType::All || group_type == WizardGroupType::Any || group_type == WizardGroupType::AtLeastOne {
+                                                            ui.add_enabled(enabled, egui::Checkbox::new(&mut selected, ""));
+                                                        } else {
+                                                            if ui.add_enabled(enabled, egui::RadioButton::new(selected == true, "")).clicked() {
+                                                                selected = true
+                                                            };
+                                                        };
+                                                        let mut label = ui.label(option.name.clone());
+                                                        label.sense = egui::Sense::click();
+                                                        if label.hovered() {
+                                                            input_data.display = (gi, oi)
+                                                        }
+                                                        if label.clicked() {
+                                                            if group_type == WizardGroupType::All || group_type == WizardGroupType::Any || group_type == WizardGroupType::AtLeastOne {
+                                                                selected = !selected
+                                                            } else {
+                                                                selected = true
+                                                            }
+                                                        }
+                                                        if selected != option.selected.clone() {
+                                                            //CURRENT: change selected, make sure at least one is selected
+                                                        }
+                                                    });
+                                                }
+                                                ui.separator();
+                                            }
+                                        });
+                                    });
+                                });
+                                ui.separator();
+                                ui.horizontal(|ui| {
+                                    let first_page = input_data.track.len() == 2;
+                                    if ui.add_enabled(!first_page, egui::Button::new("Back")).clicked() {
+                                        input_data.track.pop();
+                                        input_data.display = (0,0);
+                                    }
+                                    if *input_data.track.last().unwrap() == -1 {
+                                        if ui.button("Install").clicked() {
+                                            //CURRENT: Install wizard
+                                        }
+                                    } else if ui.button("Next").clicked() {
+                                        calculate_flags(input_data, true);
+                                        input_data.display = (0,0);
+                                    }
+                                });
+                            }
+                            //TODO Mods: Implement selectors
                             _ => {ui.close()}
                         }
 
@@ -794,7 +1132,11 @@ impl eframe::App for SuperPatchApp {
                         };
                         ui.label("Roots:");
                         for i in install_data.root_list.clone() {
-                            ui.label(i);
+                            if i.0.is_empty() {
+                                ui.label("[Archive Root");
+                            } else {
+                                ui.label(i.0);
+                            }
                         }
                         ui.label("Exclusions:");
                         for i in install_data.remove_list.clone() {
@@ -816,7 +1158,7 @@ impl eframe::App for SuperPatchApp {
                                 install_data.delete_archive = delete_archive;
                                 save_settings(self.settings.clone());
                             }
-                            ui.label("Delete Orginal Archive")
+                            ui.label("Delete Original Archive")
                         });
                         ui.label("Name:");
                         ui.text_edit_singleline(&mut install_data.name);
@@ -826,10 +1168,15 @@ impl eframe::App for SuperPatchApp {
                         ui.text_edit_singleline(&mut install_data.category);
                         ui.label("Website:");
                         ui.text_edit_singleline(&mut install_data.website);
+                        ui.horizontal(|ui| {
+                        if ui.button("Back").clicked() {
+                            self.livedata.install_modal_install_data = None;
+                        }
                         if ui.button("Install Mod").clicked() {
                             self.install_mod();
                             ui.close();
                         }
+                        });
                     }
                 }
             });
@@ -1407,6 +1754,7 @@ fn main() {
         "Superpatch",
         native_options,
         Box::new(|cc| {
+            egui_extras::install_image_loaders(&cc.egui_ctx);
             Ok(Box::new(SuperPatchApp::new(
                 cc,
                 orderdata,
@@ -1958,7 +2306,6 @@ fn vfs_scan_rar(archive_path: &Path, origin_path: &str) -> ArchiveVFSTree {
     tree
 }
 //MARK: Archive Extract
-
 struct ArchiveEntry {
     path: PathBuf,
     is_dir: bool,
@@ -1967,25 +2314,43 @@ struct ArchiveEntry {
 //SLOP
 fn resolve_relative_path(
     file_path: &Path,
-    root_list: &[String],
+    current_root: &(String, String),
+    root_list: &[(String, String)],
     remove_list: &[String],
 ) -> Option<PathBuf> {
+    let (root_raw, dest) = current_root;
+    let root = normalize_sep(root_raw);
+
+    // Root itself is a file: bypass parent_in_tf_list, which only applies to
+    // descendants of a directory root, not the root file itself.
+    if !root.is_empty() && file_path == Path::new(root.as_str()) {
+        let dest_path = if dest.is_empty() {
+            PathBuf::from(file_path.file_name().unwrap())
+        } else {
+            PathBuf::from(dest)
+        };
+        return Some(dest_path);
+    }
+
     let file_path_str = file_path.to_string_lossy().to_string();
 
     if parent_in_tf_list(&file_path_str, remove_list.to_vec(), root_list.to_vec()) != (true, true) {
         return None;
     }
 
-    let matched_root = root_list
-        .iter()
-        .filter(|r| !r.is_empty() && file_path.starts_with(r.as_str()))
-        .max_by_key(|r| r.len());
+    let stripped = if root.is_empty() {
+        if root_list.iter().any(|r| !r.0.is_empty() && file_path.starts_with(r.0.as_str())) {
+            return None;
+        }
+        file_path.to_path_buf()
+    } else {
+        if !file_path.starts_with(root.as_str()) {
+            return None;
+        }
+        file_path.strip_prefix(root).unwrap().to_path_buf()
+    };
 
-    match matched_root {
-        Some(root) => Some(file_path.strip_prefix(root).unwrap().to_path_buf()),
-        None if root_list.iter().any(|r| r.is_empty()) => Some(file_path.to_path_buf()),
-        None => None,
-    }
+    Some(Path::new(dest).join(stripped))
 }
 
 //SLOP
@@ -2003,95 +2368,248 @@ fn write_entry(target_path: &Path, relative_path: &Path, is_dir: bool, data: Opt
 
 //MARK: Archive Extract ZIP
 //SLOP
-fn archive_extract_zip(archive_path: PathBuf, target_path: PathBuf, root_list: Vec<String>, remove_list: Vec<String>) {
-    let archive_file = File::open(archive_path).unwrap();
+fn archive_extract_zip(archive_path: PathBuf, target_path: PathBuf, root_list: Vec<(String, String)>, remove_list: Vec<String>) {
+    let archive_file = File::open(&archive_path).unwrap();
     let mut archive = zip::ZipArchive::new(archive_file).unwrap();
-    for i in 0..archive.len() {
-        let mut file = archive.by_index(i).unwrap();
-        let Some(file_path) = file.enclosed_name() else { continue };
-        let Some(relative_path) = resolve_relative_path(&file_path, &root_list, &remove_list) else { continue };
 
-        if file.is_dir() {
-            write_entry(&target_path, &relative_path, true, None);
-        } else {
-            let mut buf = Vec::new();
-            std::io::copy(&mut file, &mut buf).unwrap();
-            write_entry(&target_path, &relative_path, false, Some(&buf));
+    // Process roots in order so later roots take priority on overlapping destinations.
+    for current_root in &root_list {
+        for i in 0..archive.len() {
+            let mut file = archive.by_index(i).unwrap();
+            let Some(file_path) = file.enclosed_name() else { continue };
+            let Some(relative_path) = resolve_relative_path(&file_path, current_root, &root_list, &remove_list) else { continue };
+
+            if file.is_dir() {
+                write_entry(&target_path, &relative_path, true, None);
+            } else {
+                let mut buf = Vec::new();
+                std::io::copy(&mut file, &mut buf).unwrap();
+                write_entry(&target_path, &relative_path, false, Some(&buf));
+            }
         }
     }
 }
 
 //MARK: Archive Extract 7Z
-//SLOP
-fn archive_extract_7z(archive_path: PathBuf, target_path: PathBuf, root_list: Vec<String>, remove_list: Vec<String>) {
-    sevenz_rust2::decompress_file_with_extract_fn(
-        &archive_path,
-        &target_path,
-        |entry: &sevenz_rust2::ArchiveEntry, reader: &mut dyn std::io::Read, _default_dest: &PathBuf| {
-            let file_path = PathBuf::from(entry.name());
-
-            let Some(relative_path) = resolve_relative_path(&file_path, &root_list, &remove_list) else {
-                return Ok(false); // skip this entry
-            };
-
-            let out_path = target_path.join(&relative_path);
-
-            if entry.is_directory() {
-                std::fs::create_dir_all(&out_path).unwrap();
-            } else {
-                if let Some(parent) = out_path.parent() {
-                    std::fs::create_dir_all(parent).unwrap();
-                }
-                let mut buf = Vec::new();
-                std::io::copy(reader, &mut buf).unwrap();
-                std::fs::write(&out_path, &buf).unwrap();
-            }
-
-            Ok(false) // we already wrote it ourselves; tell the crate not to also write to its default dest
-        },
-    ).unwrap();
-}
+//CURRENT: Redo all the extraction
 
 //MARK: Archive Extract RAR
 //SLOP
-fn archive_extract_rar(archive_path: PathBuf, target_path: PathBuf, root_list: Vec<String>, remove_list: Vec<String>) {
-    let mut archive = unrar::Archive::new(&archive_path)
-        .open_for_processing()
-        .unwrap();
+fn archive_extract_rar(archive_path: PathBuf, target_path: PathBuf, root_list: Vec<(String, String)>, remove_list: Vec<String>) {
+    for current_root in &root_list {
+        let mut archive = unrar::Archive::new(&archive_path)
+            .open_for_processing()
+            .unwrap();
 
-    loop {
-        let Some(header_archive) = archive.read_header().unwrap() else {
-            break; // end of archive
-        };
+        loop {
+            let Some(header_archive) = archive.read_header().unwrap() else {
+                break; // end of archive
+            };
 
-        let entry = header_archive.entry();
-        let file_path = entry.filename.clone();
-        let is_directory = entry.is_directory();
+            let entry = header_archive.entry();
+            let file_path = entry.filename.clone();
+            let is_directory = entry.is_directory();
 
-        let relative_path = resolve_relative_path(&file_path, &root_list, &remove_list);
+            let relative_path = resolve_relative_path(&file_path, current_root, &root_list, &remove_list);
 
-        archive = match relative_path {
-            None => header_archive.skip().unwrap(),
-            Some(rel) => {
-                if is_directory {
-                    let out_path = target_path.join(&rel);
-                    std::fs::create_dir_all(&out_path).unwrap();
-                    header_archive.skip().unwrap()
-                } else {
-                    let (data, rest) = header_archive.read().unwrap();
-                    let out_path = target_path.join(&rel);
-                    if let Some(parent) = out_path.parent() {
-                        std::fs::create_dir_all(parent).unwrap();
+            archive = match relative_path {
+                None => header_archive.skip().unwrap(),
+                Some(rel) => {
+                    if is_directory {
+                        let out_path = target_path.join(&rel);
+                        std::fs::create_dir_all(&out_path).unwrap();
+                        header_archive.skip().unwrap()
+                    } else {
+                        let (data, rest) = header_archive.read().unwrap();
+                        let out_path = target_path.join(&rel);
+                        if let Some(parent) = out_path.parent() {
+                            std::fs::create_dir_all(parent).unwrap();
+                        }
+                        std::fs::write(&out_path, &data).unwrap();
+                        rest
                     }
-                    std::fs::write(&out_path, &data).unwrap();
-                    rest
                 }
-            }
-        };
+            };
+        }
     }
 }
 
+//MARK: FOMOD Parsing
 
+//MARK: FileList parsing
+//SLOP
+pub fn parse_file_list(
+    doc: &Document,
+    file_list_node: NodeId,
+) -> (Vec<(String, String, usize)>, Vec<(String, String, usize)>, Vec<(String, String, usize)>) {
+    let mut roots = Vec::new();
+    let mut roots_always = Vec::new();
+    let mut roots_available = Vec::new();
+
+    let result = evaluate(doc, file_list_node, "file | folder").unwrap();
+    let nodes = result.as_node_set().unwrap();
+
+    for &node in nodes {
+        let source = evaluate(doc, node, "string(@source)").unwrap().to_string();
+
+        let dest_raw = evaluate(doc, node, "string(@destination)").unwrap().to_string();
+        let destination = if dest_raw.is_empty() { source.clone() } else { dest_raw };
+
+        let priority_raw = evaluate(doc, node, "string(@priority)").unwrap().to_string();
+        let priority: usize = priority_raw.parse().unwrap_or(0);
+
+        let always_install = evaluate(doc, node, "string(@alwaysInstall)").unwrap().to_string() == "true";
+        let install_if_usable = evaluate(doc, node, "string(@installIfUsable)").unwrap().to_string() == "true";
+
+        let entry = (source, destination, priority);
+
+        if always_install {
+            roots_always.push(entry);
+        } else if install_if_usable {
+            roots_available.push(entry);
+        }
+        else {
+            roots.push(entry);
+        }
+    }
+
+    (roots, roots_always, roots_available)
+}
+
+//SLOP
+pub fn parse_file_list_flat(doc: &Document, file_list_node: NodeId) -> Vec<(String, String, usize)> {
+    let result = evaluate(doc, file_list_node, "file | folder").unwrap();
+    let nodes = result.as_node_set().unwrap();
+
+    nodes.iter().map(|&node| {
+        let source = evaluate(doc, node, "string(@source)").unwrap().to_string();
+        let dest_raw = evaluate(doc, node, "string(@destination)").unwrap().to_string();
+        let destination = if dest_raw.is_empty() { source.clone() } else { dest_raw };
+        let priority: usize = evaluate(doc, node, "string(@priority)").unwrap().to_string().parse().unwrap_or(0);
+
+        (source, destination, priority)
+    }).collect()
+}
+
+//MARK: Dependency Parsing
+//SLOP
+fn parse_composite_deps(doc: &Document, composite_node: NodeId) -> CompositeDependency {
+    let aff_op = if evaluate(doc, composite_node, "@operator").unwrap().to_string() == "Or" { AffectOperator::Or } else { AffectOperator::And };
+    let mut aff_flags = Vec::new();
+
+    let result = evaluate(doc, composite_node, "flagDependency | dependencies").unwrap();
+    let children = result.as_node_set().unwrap();
+
+    for &child in children {
+        let name = evaluate(doc, child, "name()").unwrap().to_string();
+        match name.as_str() {
+            "flagDependency" => {
+                let flag = evaluate(doc, child, "string(@flag)").unwrap().to_string();
+                let value = evaluate(doc, child, "string(@value)").unwrap().to_string();
+                aff_flags.push(DependencyTypesGroup::Flag(flag, value));
+            }
+            "dependencies" => {
+                let nested = parse_composite_deps(doc, child); // recursion
+                aff_flags.push(DependencyTypesGroup::CompositeDependency(nested));
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    CompositeDependency { aff_flags, aff_op }
+}
+
+fn parse_flags(doc: &Document, flags_list: &Vec<NodeId>) -> Vec<(String, String)> {
+    let mut flags = Vec::<(String,String)>::new();
+    for &flag in flags_list {
+        let name = evaluate(doc, flag, "string(@name)").unwrap().to_string();
+        let value = doc.text_content(flag);
+        flags.push((name, value));
+    }
+    flags
+}
+
+//MARK: Flag Calculation
+
+fn calculate_flags(data: &mut WizardInstallData, advance: bool) {
+    //-2: Uncalculated Value
+    //-1: Last page
+    if advance {
+        data.track.push(-2);
+    }
+    let mut total_flags = HashMap::<String,String>::new();
+    let mut iter_track = data.track.clone();
+    iter_track.pop();
+    iter_track.pop();
+    for index in iter_track {
+        for group in &data.pages[index as usize].groups {
+            for option in &group.options {
+                if option.selected {
+                    for entry in &option.eff_flags {
+                        total_flags.insert(entry.0.clone(), entry.1.clone());
+                    }
+                }
+            }
+        }
+    }
+    let mut next_page_index = -1;
+    let start: usize = data.track[data.track.len() - 2].try_into().unwrap();
+    for index in (start+1)..data.pages.len() {
+        let page = &mut data.pages[index];
+        let active = flag_check(page.aff_com.clone(), total_flags.clone());
+        if active {
+            for group in &mut page.groups {
+                for option in &mut group.options {
+                    let mut active_type  = option.default_type.clone();
+                    if group.group_type == WizardGroupType::All {
+                        active_type = OptionAffectType::Required;
+                    } else {
+                        for aff_data in &option.aff_data {
+                            if flag_check(aff_data.aff_com.clone(), total_flags.clone()) {
+                                active_type = aff_data.aff_type.clone();
+                                break;
+                            }
+                        }
+                    }
+                    if active_type == OptionAffectType::Required {
+                        option.selected = true;
+                    }
+                    if active_type == OptionAffectType::Disallowed {
+                        option.selected = false;
+                    }
+                    option.active_type = active_type;
+                }
+            }
+            next_page_index = index as i32;
+            break;
+        }
+    }
+    let len = data.track.len();
+    data.track[len-1] = next_page_index;
+}
+
+//MARK Flag Check
+//SLOP
+fn flag_check(check: CompositeDependency, reference: HashMap<String, String>) -> bool {
+    match check.aff_op {
+        AffectOperator::And => check.aff_flags.par_iter().all(|dep| match dep {
+            DependencyTypesGroup::Flag(key, value) => {
+                reference.get(key.as_str()).map(|v| v == value).unwrap_or(false)
+            }
+            DependencyTypesGroup::CompositeDependency(nested) => {
+                flag_check(nested.clone(), reference.clone())
+            }
+        }),
+        AffectOperator::Or => check.aff_flags.par_iter().any(|dep| match dep {
+            DependencyTypesGroup::Flag(key, value) => {
+                reference.get(key.as_str()).map(|v| v == value).unwrap_or(false)
+            }
+            DependencyTypesGroup::CompositeDependency(nested) => {
+                flag_check(nested.clone(), reference.clone())
+            }
+        }),
+    }
+}
 //MARK: Tools
 fn pathdiff(path: &str, reference: &str) -> String {
     let path = std::path::Path::new(path);
@@ -2179,14 +2697,15 @@ fn clean_name(s: &str) -> String {
 }
 
 //SLOP
-fn parent_in_tf_list(search: &str, false_list: Vec<String>, true_list: Vec<String>) -> (bool, bool) {
+fn parent_in_tf_list(search: &str, false_list: Vec<String>, true_list: Vec<(String, String)>) -> (bool, bool) {
     let mut current = Path::new(search);
 
     while let Some(parent) = current.parent() {
-        if true_list.par_iter().any(|p| p == &parent.to_string_lossy().to_string()) {
+        let parent_str = parent.to_string_lossy().to_string();
+        if true_list.par_iter().any(|p| normalize_sep(&p.0) == parent_str) {
             return (true, true);
         }
-        if false_list.par_iter().any(|p| p == &parent.to_string_lossy().to_string()) {
+        if false_list.par_iter().any(|p| normalize_sep(p) == parent_str) {
             return (true, false);
         }
         if parent.as_os_str().is_empty() {
@@ -2196,4 +2715,36 @@ fn parent_in_tf_list(search: &str, false_list: Vec<String>, true_list: Vec<Strin
     }
 
     (false, false)
+}
+
+fn check_extension_type(path: PathBuf) -> ExtensionType {
+    let ext = path.extension().unwrap();
+    if ext == OsStr::new("zip") {
+        ExtensionType::Zip
+    } else if ext == OsStr::new("rar") {
+        ExtensionType::Rar
+    } else if ext == OsStr::new("7z") || ext == OsStr::new("7zip") {
+        ExtensionType::SevenZ
+    } else {
+        panic!()
+    }
+}
+
+//SLOP
+fn normalize_sep(s: &str) -> String {
+    s.replace('\\', "/")
+}
+
+fn archive_extract_univ(extension_type: ExtensionType, archive_path: PathBuf, target_path: PathBuf, root_list: Vec<(String, String)>, remove_list: Vec<String>) {
+    match extension_type {
+        ExtensionType::Zip => {
+            archive_extract_zip(archive_path, target_path, root_list, remove_list);
+        },
+        ExtensionType::Rar => {
+            archive_extract_rar(archive_path, target_path, root_list, remove_list);
+        },
+        ExtensionType::SevenZ => {
+            todo!(archive_path, target_path, root_list, remove_list);
+        },
+    }
 }
