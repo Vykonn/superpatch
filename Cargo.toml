@@ -15,11 +15,11 @@ rayon = "1.12.0"
 regex = "1.13.0"
 serde = "1.0.228"
 serde_json = "1.0.150"
-sevenz-rust2 = "0.21.3"
 sysinfo = "0.39.6"
-unrar = "0.5.8"
-xmloxide = "0.4.3"
-zip = "8.6.0"
+unarc-rs = "0.6.1"
+walkdir = "2.5.0"
+xmloxide = "0.4.4"
+zesven = { version = "1.2.0", default-features = true, features=["fast-lzma2", "sysinfo"] }
 
 [profile.release]
 strip = true
