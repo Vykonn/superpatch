@@ -10,11 +10,8 @@ use serde_json::{Value, json};
 use unarc_rs::unified::ArchiveFormat;
 use xmloxide::{Document, NodeId};
 use xmloxide::xpath::evaluate;
-use std::any::Any;
-use std::collections::HashSet;
-use std::ffi::OsStr;
-use std::fs::File;
-use std::io::{self, Read, Seek};
+use std::fs::{File, create_dir_all, remove_dir_all};
+use std::io::{self, BufWriter, Write};
 use std::sync::{Arc, Mutex};
 use std::{env, fs, thread};
 use std::path::Path;
@@ -302,6 +299,15 @@ enum ExtensionType {
     SevenZ
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+static SEVEN_ZIP_BYTES: &[u8] = include_bytes!("../binaries/7zz-x86_64-linux");
+
+#[cfg(all(target_os = "windows", target_arch = "x86_64"))]
+static SEVEN_ZIP_BYTES: &[u8] = include_bytes!("../binaries/7zz-x86_64-windows.exe");
+
+#[cfg(all(target_os = "macos"))]
+static SEVEN_ZIP_BYTES: &[u8] = include_bytes!("../binaries/7zz-macos");
+
 impl SuperPatchApp {
     fn new(
         _cc: &eframe::CreationContext<'_>,
@@ -466,23 +472,6 @@ impl SuperPatchApp {
         archive_extract(self.livedata.install_modal_path.clone(), temp_dir.clone(), vec![("fomod/ModuleConfig.xml".to_string(), String::new())], Vec::new());
         let mod_xml = Document::parse_file(temp_dir.join("ModuleConfig.xml")).unwrap();
         let root = mod_xml.root_element().unwrap();
-        let mut name = String::new();
-        let mut website = String::new();
-        let mut version = String::new();
-        let info_exists = fomod_vfs.contains_key("info.xml");
-        if info_exists {
-            archive_extract(self.livedata.install_modal_path.clone(), temp_dir.clone(), vec![("fomod/info.xml".to_string(), String::new())], Vec::new());
-            //Get name, version & website from info.xml
-            let info_xml = Document::parse_file(temp_dir.join("info.xml")).unwrap();
-            let root = info_xml.root_element().unwrap();
-            name = evaluate(&info_xml, root, "string(Name)").unwrap().to_string();
-            website = evaluate(&info_xml, root, "string(Website)").unwrap().to_string();
-            version = evaluate(&info_xml, root, "string(Version)").unwrap().to_string();
-        }
-        else {
-            let module_name = evaluate(&mod_xml, root, "string(moduleName)").unwrap().to_string();
-            (name, version) = parse_archive_name(&module_name);
-        }
         //Get image from ModuleConfig.xml
         let mut image_roots = Vec::<(String, String)>::new();
         let image_original = evaluate(&mod_xml, root, "string(moduleImage/@path)").unwrap().to_string();
@@ -602,7 +591,25 @@ impl SuperPatchApp {
             }
             None => panic!("No Pages!")
         }
-        archive_extract(self.livedata.install_modal_path.clone(), temp_dir.clone(), image_roots, Vec::new());
+        let mut name = String::new();
+        let mut website = String::new();
+        let mut version = String::new();
+        let info_exists = fomod_vfs.contains_key("info.xml");
+        if info_exists {
+            image_roots.push(("fomod/info.xml".to_string(), String::new()));
+            archive_extract(self.livedata.install_modal_path.clone(), temp_dir.clone(), image_roots, Vec::new());
+            //Get name, version & website from info.xml
+            let info_xml = Document::parse_file(temp_dir.join("info.xml")).unwrap();
+            let root = info_xml.root_element().unwrap();
+            name = evaluate(&info_xml, root, "string(Name)").unwrap().to_string();
+            website = evaluate(&info_xml, root, "string(Website)").unwrap().to_string();
+            version = evaluate(&info_xml, root, "string(Version)").unwrap().to_string();
+        }
+        else {
+            archive_extract(self.livedata.install_modal_path.clone(), temp_dir.clone(), image_roots, Vec::new());
+            let module_name = evaluate(&mod_xml, root, "string(moduleName)").unwrap().to_string();
+            (name, version) = parse_archive_name(&module_name);
+        }
         let mut data =  WizardInstallData {init_roots, pages, name, version, website, image, track: vec![0,-2], display: (0,0)};
         calculate_flags(&mut data, false);
         self.livedata.install_modal_input_data = InstallModalInputData::Wizard(data);
@@ -628,8 +635,7 @@ impl SuperPatchApp {
         }
         let target_path = Path::new("mods").join(install_data.name.clone());
         archive_extract(self.livedata.install_modal_path.clone(), target_path.clone(), install_data.root_list.clone(), install_data.remove_list.clone());
-        let mut archive_path = String::new();
-        if install_data.copy_archive {
+        let archive_path = if install_data.copy_archive {
             if !Path::exists(Path::new("archives")) {
                 fs::create_dir("archives").expect("Failed to create configs directory");
             }
@@ -637,6 +643,10 @@ impl SuperPatchApp {
             let file_name = src.file_name().expect("Archive path has no file name");
             let dst = Path::new("archives").join(file_name);
             if src != dst {
+                //Remove if already exists
+                if dst.exists() {
+                    fs::remove_file(&dst).unwrap();
+                }
                 // Try hardlink first (same filesystem, instant, no extra disk usage)
                 match fs::hard_link(src, &dst) {
                     Ok(()) => {}
@@ -660,8 +670,10 @@ impl SuperPatchApp {
                     }
                 }
             }
-            archive_path = dst.to_string_lossy().to_string();
-        }
+            dst.to_string_lossy().to_string()
+        } else {
+            self.livedata.install_modal_path.to_string_lossy().to_string()
+        };
         if install_data.delete_archive {
             fs::remove_file(self.livedata.install_modal_path.clone()).expect("Failed to delete archive");
         }
@@ -2186,7 +2198,6 @@ fn scan_archive(archive_path: &PathBuf) -> ArchiveVFSTree {
             continue;
         }
         let is_dir = entry.original_size() == 0;
-        println!("Entry: {}", entry.name());
         let mut tree_section = &mut tree;
         for (index, component) in components.iter().enumerate() {
             if index == components.len()-1 {
@@ -2217,62 +2228,76 @@ fn scan_archive(archive_path: &PathBuf) -> ArchiveVFSTree {
 
 //MARK: Archive Extraction
 
-//PARTIAL SLOP
 fn archive_extract(archive_path: PathBuf, target_path: PathBuf, root_list: Vec<(String, String)>, remove_list: Vec<String>) {
-    //CURRENT 1: Unbelievably slow on 7z.
     let mut archive = ArchiveFormat::open_path(&archive_path).unwrap();
     match archive.format() {
-    unarc_rs::unified::ArchiveFormat::SevenZ => {
-            // --- 1. Cheap pre-scan: build the exact file list from metadata only ---
-            let mut archive_meta = zesven::StreamingArchive::open_path(&archive_path, "").unwrap();
-            let mut wanted: HashSet<String> = HashSet::new();
-            for entry_result in archive_meta.entries().unwrap() {
-                let entry = entry_result.unwrap();
-                let goahead = parent_in_tf_list(entry.name(), &remove_list, &root_list);
-                if goahead.1 {
-                    wanted.insert(normalize_sep(entry.name()).to_string());
-                }
-            }
-            if wanted.is_empty() { return; }
-
-            // --- 2. Extract only what we want, stop when done ---
-            let config = zesven::StreamingConfig::high_performance();
-            let mut archive = zesven::StreamingArchive::open_path_with_config(&archive_path, "", config).unwrap();
-            let mut iter = archive.entries().unwrap();
-            let mut remaining = wanted.len();
-
-            let ts = std::time::Instant::now();
-            while let Some(entry_result) = iter.next() {
-                let entry = entry_result.unwrap();
-                let name = normalize_sep(entry.name());
-                if wanted.contains(&name) {
+    unarc_rs::unified::ArchiveFormat::SevenZ | unarc_rs::unified::ArchiveFormat::Zip | unarc_rs::unified::ArchiveFormat::Rar => {
+        //speedy method
+        //do normal process but save to Vec<(origin, destination)> instead
+        //make tempdir
+        //make listfile from Vec.origin
+        //extract using 7z
+        //for file in Vec, move to destination
+        let mut listfile_vec: Vec<(String, PathBuf)> = Vec::new();
+        for entry in archive.entries_iter() {
+            let entry = entry.unwrap();
+            let extract_goahead = parent_in_tf_list(&normalize_sep(entry.name()), &remove_list, &root_list);
+            if extract_goahead.1 == true {
+                if entry.original_size() != 0 {
                     let mut output_path = target_path.clone();
-                    output_path.push(
-                        parent_in_tf_list(entry.name(), &remove_list, &root_list).2
-                    );
-                    output_path.push(name.rsplit_once("/").unwrap().1);
-                    fs::create_dir_all(output_path.parent().unwrap()).unwrap();
-                    let mut output = File::create(output_path).unwrap();
-                    iter.extract_current_to(&mut output).unwrap();
-
-                    remaining -= 1;
-                    if remaining == 0 {
-                        break; // <-- EARLY EXIT
-                    }
+                    output_path.push(extract_goahead.2);
+                    output_path.push(entry.file_name());
+                    listfile_vec.push((normalize_sep(entry.name()), output_path));
                 }
             }
-            println!("Completed in {} ms", ts.elapsed().as_millis());
+        } 
+        let temp_dir = env::temp_dir().join("superpatch_extract");
+        if temp_dir.exists() {
+            remove_dir_all(&temp_dir).unwrap();
         }
+        create_dir_all(&temp_dir).unwrap();
+        let listfile_path = &temp_dir.join("listfile.txt");
+        let mut listfile_write = File::create(listfile_path).unwrap();
+        let first_elements: Vec<String> = listfile_vec.iter().map(|(first, _)|first.clone()).collect();
+        listfile_write.write_all(first_elements.join("\n").as_bytes()).unwrap();
+        let bin = get_7z_binary_path().unwrap();
+        let status = Command::new(&bin)
+            .arg("x")
+            .arg(&archive_path)
+            .arg(format!("-o{}", temp_dir.display()))
+            .arg("-y")
+            .arg("-aoa")
+            .arg("-bb0")
+            .arg(format!("-i@{}", listfile_path.display()))
+            .status()
+            .expect("Failed to run 7zz");
+        let _ = fs::remove_file(listfile_path);
+
+        if !status.success() {
+            let _ = fs::remove_dir_all(&temp_dir);
+            panic!("7zz failed: {:?}", status);
+        }
+        for file in listfile_vec {
+            if fs::exists(&file.1).unwrap() {
+                fs::remove_file(&file.1).unwrap();
+            }
+            create_dir_all(Path::new(&file.1).parent().unwrap()).unwrap();
+            fs::rename(temp_dir.join(file.0), file.1).unwrap();
+        }
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
     _ => {
         for entry in archive.entries().unwrap() {
-            let extract_goahead = parent_in_tf_list(entry.name(), &remove_list, &root_list);
+            let extract_goahead = parent_in_tf_list(&normalize_sep(entry.name()), &remove_list, &root_list);
             if extract_goahead.1 == true {
-                let mut output_path = target_path.clone();
-                output_path.push(extract_goahead.2);
-                output_path.push(normalize_sep(entry.file_name()));
-                fs::create_dir_all(output_path.parent().unwrap()).unwrap();
-                let mut output = File::create(output_path).unwrap();
-                archive.read_to(&entry, &mut output).unwrap();
+                if entry.original_size() != 0 {
+                    let mut output_path = target_path.clone();
+                    output_path.push(extract_goahead.2);
+                    output_path.push(entry.file_name());
+                    fs::create_dir_all(output_path.parent().unwrap()).unwrap();
+                    let mut output = File::create(output_path).unwrap();
+                    archive.read_to(&entry, &mut output).unwrap();
+                }
             }
         }
     }  
@@ -2547,7 +2572,8 @@ fn parent_in_tf_list(search: &str, false_list: &Vec<String>, true_list: &Vec<(St
         let parent_str = parent.to_string_lossy().to_string();
         let true_find = true_list.par_iter().find_any(|p| normalize_sep(&p.0) == parent_str);
         if true_find.is_some() {
-            return (true,true,true_find.unwrap().1.clone())
+            let return_dir = Path::new(&true_find.unwrap().1.clone()).join(pathdiff(&Path::new(search).parent().unwrap().to_string_lossy().to_string(), &true_find.unwrap().0.clone())).to_string_lossy().to_string();
+            return (true,true, return_dir)
         }
         if false_list.par_iter().any(|p| normalize_sep(p) == parent_str) {
             return (true, false, String::new());
@@ -2564,4 +2590,31 @@ fn parent_in_tf_list(search: &str, false_list: &Vec<String>, true_list: &Vec<(St
 //SLOP
 fn normalize_sep(s: &str) -> String {
     s.replace('\\', "/")
+}
+
+//SLOP
+fn get_7z_binary_path() -> std::io::Result<PathBuf> {
+    // Use a persistent cache dir so we only write once
+    let cache_dir = std::env::temp_dir().join("superpatch");
+    fs::create_dir_all(&cache_dir)?;
+
+    let bin_name = if cfg!(windows) { "7zz.exe" } else { "7zz" };
+    let bin_path = cache_dir.join(bin_name);
+
+    // Only write if not already present (simple check; add hash if you want updates)
+    if !bin_path.exists() {
+        let mut file = File::create(&bin_path)?;
+        file.write_all(SEVEN_ZIP_BYTES)?;
+
+        // Make executable on Unix
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&bin_path)?.permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&bin_path, perms)?;
+        }
+    }
+
+    Ok(bin_path)
 }

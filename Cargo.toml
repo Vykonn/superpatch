@@ -17,9 +17,7 @@ serde = "1.0.228"
 serde_json = "1.0.150"
 sysinfo = "0.39.6"
 unarc-rs = "0.6.1"
-walkdir = "2.5.0"
 xmloxide = "0.4.4"
-zesven = { version = "1.2.0", default-features = true, features=["fast-lzma2", "sysinfo"] }
 
 [profile.release]
 strip = true
