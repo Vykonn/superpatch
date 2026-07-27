@@ -2372,8 +2372,9 @@ fn archive_extract(archive_path: PathBuf, target_path: PathBuf, root_list: Vec<(
             if extract_goahead.1 == true {
                 if entry.original_size() != 0 {
                     let mut output_path = target_path.clone();
-                    output_path.push(extract_goahead.2);
+                    output_path.push(&extract_goahead.2);
                     output_path.push(entry.file_name());
+                    println!("Moving {} to {} ({} + {} + {})", entry.name(), output_path.to_string_lossy().to_string(), target_path.clone().to_string_lossy().to_string(), extract_goahead.2, entry.file_name());
                     listfile_vec.push((normalize_sep(entry.name()), output_path));
                 }
             }
@@ -2409,7 +2410,8 @@ fn archive_extract(archive_path: PathBuf, target_path: PathBuf, root_list: Vec<(
                 fs::remove_file(&file.1).unwrap();
             }
             create_dir_all(Path::new(&file.1).parent().unwrap()).unwrap();
-            fs::rename(temp_dir.join(file.0), file.1).unwrap();
+            fs::copy(temp_dir.join(&file.0), file.1).unwrap();
+            fs::remove_file(temp_dir.join(file.0)).unwrap();
         }
         fs::remove_dir_all(temp_dir).unwrap();
     }
@@ -2705,21 +2707,34 @@ fn clean_name(s: &str) -> String {
 
 //SLOP
 fn parent_in_tf_list(search: &str, false_list: &Vec<String>, true_list: &Vec<(String, String)>) -> (bool, bool, String) {
-    let true_find = true_list.par_iter().find_any(|p| normalize_sep(&p.0) == search);
-    if true_find.is_some() {
-        return (true,true,true_find.unwrap().1.clone())
+    // Direct match: search itself is a mapped root.
+    if let Some((_, dst)) = true_list.par_iter().find_any(|p| normalize_sep(&p.0) == search) {
+        return (true, true, dst.clone());
     }
+
     let mut current = Path::new(search);
     while let Some(parent) = current.parent() {
         let parent_str = parent.to_string_lossy().to_string();
-        let true_find = true_list.par_iter().find_any(|p| normalize_sep(&p.0) == parent_str);
-        if true_find.is_some() {
-            let return_dir = Path::new(&true_find.unwrap().1.clone()).join(pathdiff(&Path::new(search).parent().unwrap().to_string_lossy().to_string(), &true_find.unwrap().0.clone())).to_string_lossy().to_string();
-            return (true,true, return_dir)
+
+        // Check if this ancestor is a mapped root.
+        if let Some((matched_src, matched_dst)) = true_list.par_iter().find_any(|p| normalize_sep(&p.0) == parent_str) {
+            let norm_src = normalize_sep(matched_src);
+            let norm_search = normalize_sep(search);
+            let rel = pathdiff(&norm_search, &norm_src);
+            debug_assert_ne!(rel, norm_search, "strip_prefix failed: {} is not prefixed by {}", norm_search, norm_src);
+            let return_dir = Path::new(matched_dst)
+                .join(&rel)
+                .parent()
+                .unwrap_or_else(|| Path::new(""))
+                .to_string_lossy()
+                .to_string();
+            return (true, true, return_dir);
         }
+
         if false_list.par_iter().any(|p| normalize_sep(p) == parent_str) {
             return (true, false, String::new());
         }
+
         if parent.as_os_str().is_empty() {
             break;
         }
