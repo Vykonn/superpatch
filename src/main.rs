@@ -11,7 +11,7 @@ use unarc_rs::unified::ArchiveFormat;
 use xmloxide::{Document, NodeId};
 use xmloxide::xpath::evaluate;
 use std::fs::{File, create_dir_all, remove_dir_all};
-use std::io::{self, BufWriter, Write};
+use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 use std::{env, fs, thread};
 use std::path::Path;
@@ -118,6 +118,7 @@ struct LiveData {
     install_modal_open: bool,
     install_modal_path: PathBuf,
     install_modal_type: InstallModalType,
+    install_modal_root: String,
     install_modal_vfs_data: Option<ArchiveVFSTree>,
     install_modal_input_data: InstallModalInputData,
     install_modal_install_data: Option<InstallModalInstallData>,
@@ -206,7 +207,8 @@ struct WizardInstallData {
     //Upon any option changing, calculate next page flags.
     track: Vec<i32>,
     //Current group, current otion
-    display: (usize, usize)
+    display: (usize, usize),
+    conditional_roots: Vec<ConditionalRoot>
 }
 #[derive(Clone,PartialEq)]
 struct WizardPage {
@@ -271,6 +273,13 @@ struct CompositeDependency {
 enum DependencyTypesGroup {
     Flag(String, String),
     CompositeDependency(CompositeDependency)
+}
+#[derive(Clone, PartialEq)]
+struct ConditionalRoot {
+    roots: Vec<(String, String, usize)>,
+    aff_com: CompositeDependency,
+    //LIVE: Meets reqs?
+    active: bool
 }
 
 #[derive(Clone)]
@@ -343,6 +352,7 @@ impl SuperPatchApp {
                 install_modal_open: false,
                 install_modal_path: PathBuf::new(),
                 install_modal_type: InstallModalType::None,
+                install_modal_root: String::new(),
                 install_modal_vfs_data: None,
                 install_modal_input_data: InstallModalInputData::None,
                 install_modal_install_data: None,
@@ -389,12 +399,21 @@ impl SuperPatchApp {
     fn check_mod_type(&mut self) {
         //TODO Mods: Detect selectors and skips
 
-        //CURRENT 1: Allow fomod in other root (suprisingly difficult!)
-        //Need to change ALL the paths. (fixed extracts, image extracts, file extracts.)
-        //Might be easier to add as a input to extract fn.
         if self.livedata.install_modal_vfs_data.as_ref().unwrap().contains_key("fomod") {
             self.livedata.install_modal_type = InstallModalType::Wizard;
+            self.livedata.install_modal_root = String::new();
             return;
+        }
+        //Allow fomod in other root (suprisingly difficult!)
+        if self.livedata.install_modal_vfs_data.as_ref().unwrap().len() == 1 {
+            let mainfolder = self.livedata.install_modal_vfs_data.as_ref().unwrap().first_key_value().unwrap();
+            if let ArchiveVFSNode::Dir(mainfoldertree) = mainfolder.1 {
+                if mainfoldertree.contains_key("fomod") {
+                    self.livedata.install_modal_type = InstallModalType::Wizard;
+                    self.livedata.install_modal_root = [mainfolder.0.to_string(), "/".to_string()].concat();
+                    return;
+                }
+            }
         }
         //One root, skip
 
@@ -459,17 +478,31 @@ impl SuperPatchApp {
     }
     fn install_modal_create_input_data_wizard(&mut self) {
         //FOMOD data (https://stepmodifications.org/wiki/Guide:FOMOD) (https://fomod-docs.readthedocs.io/en/latest/specs.html)
-        let fomod_vfs = match self.livedata.install_modal_vfs_data.as_ref().unwrap().get_key_value("fomod").unwrap().1 {
-            ArchiveVFSNode::Dir(data) => data,
-            _ => panic!()
+        let fomod_vfs =  if self.livedata.install_modal_vfs_data.as_ref().unwrap().contains_key("fomod") {
+            match self.livedata.install_modal_vfs_data.as_ref().unwrap().get_key_value("fomod").unwrap().1 {
+                ArchiveVFSNode::Dir(data) => data,
+                _ => panic!()
+            }
+        } else {
+            let mainfolder = self.livedata.install_modal_vfs_data.as_ref().unwrap().first_key_value().unwrap();
+            match mainfolder.1 {
+                ArchiveVFSNode::Dir(data) => {
+                    match data.get_key_value("fomod").unwrap().1 {
+                        ArchiveVFSNode::Dir(data) => data,
+                        _ => panic!()
+                    }
+                },
+                _ => panic!()
+            }
         };
+        let install_root = self.livedata.install_modal_root.clone();
         //Extract 1
         let temp_dir = env::temp_dir().join(self.livedata.install_modal_path.file_stem().unwrap());
         if temp_dir.is_dir() {
             fs::remove_dir_all(&temp_dir).unwrap();
         }
         fs::create_dir(&temp_dir).unwrap();
-        archive_extract(self.livedata.install_modal_path.clone(), temp_dir.clone(), vec![("fomod/ModuleConfig.xml".to_string(), String::new())], Vec::new());
+        archive_extract(self.livedata.install_modal_path.clone(), temp_dir.clone(), vec![([install_root.clone(), "fomod/ModuleConfig.xml".to_string()].concat(), String::new())], Vec::new());
         let mod_xml = Document::parse_file(temp_dir.join("ModuleConfig.xml")).unwrap();
         let root = mod_xml.root_element().unwrap();
         //Get image from ModuleConfig.xml
@@ -484,9 +517,31 @@ impl SuperPatchApp {
         //Load init_roots from ModuleConfig.xml
         let required_install = evaluate(&mod_xml, root, "requiredInstallFiles").unwrap().as_node_set().and_then(|nodes| nodes.first().copied());
         let init_roots = match required_install {
-            Some(required_install) => {parse_file_list_flat(&mod_xml, required_install)}
+            Some(required_install) => {parse_file_list_flat(&mod_xml, required_install, install_root.clone())}
             None => Vec::new()
         };
+        //Load conditional roots
+        let pattern_list_eval = evaluate(&mod_xml, root, "conditionalFileInstalls/patterns/pattern").unwrap();
+        let pattern_list = pattern_list_eval.as_node_set();
+        let mut conditional_roots = Vec::new();
+        if let Some(pattern_list) = pattern_list {
+            for pattern in pattern_list {
+                let dependency_group = evaluate(&mod_xml, *pattern, "dependencies").unwrap().as_node_set().and_then(|nodes| nodes.first().copied());
+                let aff_com = match dependency_group {
+                    Some(dependency_group) => {parse_composite_deps(&mod_xml, dependency_group)},
+                    None => CompositeDependency { aff_flags: Vec::new(), aff_op: AffectOperator::And }
+                };
+                let install_files = evaluate(&mod_xml, *pattern, "files").unwrap().as_node_set().and_then(|nodes| nodes.first().copied());
+                let roots = match install_files {
+                    Some(install_files) => {parse_file_list_flat(&mod_xml, install_files, install_root.clone())},
+                    None => {Vec::new()}
+                };
+                let pattern = ConditionalRoot {aff_com, roots, active: false};
+                conditional_roots.push(pattern);
+            }
+
+        }
+        //Page parsing
         let mut pages = Vec::new();
         let install_steps_eval = evaluate(&mod_xml, root, "installSteps/installStep").unwrap();
         let install_steps = install_steps_eval.as_node_set();
@@ -506,7 +561,7 @@ impl SuperPatchApp {
                                     Some(options_list) => {
                                         for option in options_list {
                                             let install_files = evaluate(&mod_xml, *option, "files").unwrap().as_node_set().and_then(|nodes| nodes.first().copied());
-                                            let dependency_group_eval = evaluate(&mod_xml, *option, "ConditionFlags/dependencyTypesGroup").unwrap();
+                                            let dependency_group_eval = evaluate(&mod_xml, *option, "conditionFlags/flag").unwrap();
                                             let dependency_group = dependency_group_eval.as_node_set();
                                             let eff_flags = match dependency_group {
                                                 Some(dependency_group) => {parse_flags(&mod_xml, dependency_group)},
@@ -522,37 +577,37 @@ impl SuperPatchApp {
                                                     Some(dependency_group) => {parse_composite_deps(&mod_xml, dependency_group)},
                                                     None => CompositeDependency { aff_flags: Vec::new(), aff_op: AffectOperator::And }
                                                 };
-                                                let aff_type_eval = evaluate(&mod_xml, *pattern, "@type").unwrap().to_string();
+                                                let aff_type_eval = evaluate(&mod_xml, *pattern, "type/@name").unwrap().to_string();
                                                 let aff_type = match aff_type_eval.as_str() {
                                                     "Required" => OptionAffectType::Required,
                                                     "Optional" => OptionAffectType::Allowed,
                                                     "Recommended" => OptionAffectType::Allowed,
                                                     "NotUsable" => OptionAffectType::Disallowed,
                                                     "CouldBeUsable" => OptionAffectType::Allowed,
-                                                    other => panic!("Unknown type when required: {}", other)
+                                                    other => panic!("Unknown type when required: {} Option name: {}", other, evaluate(&mod_xml, *option, "string(@name)").unwrap().to_string())
                                                 };
                                                 let pattern = OptionAffectData {aff_com, aff_type};
                                                 aff_data.push(pattern);
                                                 }
                                             }
                                             let (roots, roots_always, roots_available) = match install_files {
-                                                Some(install_files) => {parse_file_list(&mod_xml, install_files)},
+                                                Some(install_files) => {parse_file_list(&mod_xml, install_files, install_root.clone())},
                                                 None => {(Vec::new(), Vec::new(), Vec::new())}
                                             };
-                                            let default_type_eval = evaluate(&mod_xml, *option, "string(typeDescriptor/dependencyType/defaultType/@name)").unwrap().to_string();
+                                            let default_type_eval = evaluate(&mod_xml, *option, "string(typeDescriptor/type/@name)").unwrap().to_string();
                                             let default_type = match default_type_eval.as_str() {
                                                 "Required" => OptionAffectType::Required,
                                                 "Optional" => OptionAffectType::Allowed,
                                                 "Recommended" => OptionAffectType::Allowed,
                                                 "NotUsable" => OptionAffectType::Disallowed,
                                                 "CouldBeUsable" => OptionAffectType::Allowed,
-                                                other => {println!("Unknown type: {}", other);OptionAffectType::Allowed}
+                                                other => {eprintln!("Unknown type: {}", other);OptionAffectType::Allowed}
                                             };
                                             let name = evaluate(&mod_xml, *option, "string(@name)").unwrap().to_string();
                                             let description = evaluate(&mod_xml, *option, "string(description)").unwrap().to_string();
                                             let image_original = evaluate(&mod_xml, *option, "string(image/@path)").unwrap().to_string();
                                             let image = if !image_original.is_empty() {
-                                                image_roots.push((image_original.clone(), String::new()));
+                                                image_roots.push(([install_root.clone(),image_original.clone()].concat(), String::new()));
                                                 temp_dir.join(Path::new(&normalize_sep(&image_original)).file_name().unwrap())
                                             } else {
                                                 Path::new("").to_path_buf()
@@ -580,7 +635,7 @@ impl SuperPatchApp {
                         None => panic!("No groups!")
                     }
                     let name = evaluate(&mod_xml, *install_step, "string(@name)").unwrap().to_string();
-                    let dependency_group = evaluate(&mod_xml, *install_step, "visible/dependencyTypesGroup").unwrap().as_node_set().and_then(|nodes| nodes.first().copied());
+                    let dependency_group = evaluate(&mod_xml, *install_step, "visible").unwrap().as_node_set().and_then(|nodes| nodes.first().copied());
                     let aff_com = match dependency_group {
                         Some(dependency_group) => {parse_composite_deps(&mod_xml, dependency_group)},
                         None => CompositeDependency { aff_flags: Vec::new(), aff_op: AffectOperator::And }
@@ -596,7 +651,7 @@ impl SuperPatchApp {
         let mut version = String::new();
         let info_exists = fomod_vfs.contains_key("info.xml");
         if info_exists {
-            image_roots.push(("fomod/info.xml".to_string(), String::new()));
+            image_roots.push(([install_root, "fomod/info.xml".to_string()].concat(), String::new()));
             archive_extract(self.livedata.install_modal_path.clone(), temp_dir.clone(), image_roots, Vec::new());
             //Get name, version & website from info.xml
             let info_xml = Document::parse_file(temp_dir.join("info.xml")).unwrap();
@@ -610,7 +665,8 @@ impl SuperPatchApp {
             let module_name = evaluate(&mod_xml, root, "string(moduleName)").unwrap().to_string();
             (name, version) = parse_archive_name(&module_name);
         }
-        let mut data =  WizardInstallData {init_roots, pages, name, version, website, image, track: vec![0,-2], display: (0,0)};
+        let mut data =  WizardInstallData {init_roots, pages, name, version, website, image, track: vec![0,-2], display: (0,0), conditional_roots};
+        calculate_flags(&mut data, false);
         calculate_flags(&mut data, false);
         self.livedata.install_modal_input_data = InstallModalInputData::Wizard(data);
     }
@@ -1035,7 +1091,8 @@ impl eframe::App for SuperPatchApp {
                                     ui.separator();
                                     egui::ScrollArea::vertical().max_width(250.0).auto_shrink(false).show(ui, |ui| {
                                         ui.vertical(|ui| {
-                                            for (gi, group) in &mut input_data.pages[page_index].groups.iter().enumerate() {
+                                            let mut update_flags = false;
+                                            for (gi, group) in &mut input_data.pages[page_index].groups.iter_mut().enumerate() {
                                                 ui.horizontal(|ui| {
                                                     ui.label(group.name.clone());
                                                     ui.add(egui::Separator::default().horizontal())
@@ -1049,39 +1106,79 @@ impl eframe::App for SuperPatchApp {
                                                     WizardGroupType::AtMostOne => "Select at most one"
                                                 };
                                                 ui.label(RichText::new(group_type_label).small());
-                                                for (oi, option) in &mut group.options.iter().enumerate() {
+                                                let selected = !group.options.par_iter().any(|option| option.selected);
+                                                if group_type == WizardGroupType::AtMostOne {
                                                     ui.horizontal(|ui| {
-                                                        let enabled = if option.active_type == OptionAffectType::Allowed {
-                                                            true
-                                                        } else {
-                                                            false
-                                                        };
-                                                        let mut selected = option.selected.clone();
+                                                        if ui.add(egui::RadioButton::new(selected, "")).clicked() {
+                                                            for option in &mut group.options {
+                                                                option.selected = false
+                                                            }
+                                                            update_flags = true;
+                                                        }
+                                                        let mut label = ui.label("None");
+                                                        label.sense = egui::Sense::click();
+                                                        if label.clicked() {
+                                                            for option in &mut group.options {
+                                                                option.selected = false
+                                                            }
+                                                            update_flags = true;
+                                                        }
+                                                    });
+                                                }
+                                                //SLOP-ish
+                                                for oi in 0..group.options.len() {
+                                                    let (name, active_type, old_selected) = {
+                                                        let option = &group.options[oi];
+                                                        (option.name.clone(), option.active_type.clone(), option.selected)
+                                                    };
+
+                                                    ui.horizontal(|ui| {
+                                                        let enabled = active_type == OptionAffectType::Allowed;
+                                                        let mut selected = old_selected;
+
                                                         if group_type == WizardGroupType::All || group_type == WizardGroupType::Any || group_type == WizardGroupType::AtLeastOne {
-                                                            ui.add_enabled(enabled, egui::Checkbox::new(&mut selected, ""));
+                                                            let checkbox = ui.add_enabled(enabled, egui::Checkbox::new(&mut selected, ""));
+                                                            if checkbox.hovered() {
+                                                                input_data.display = (gi, oi);
+                                                            }
                                                         } else {
-                                                            if ui.add_enabled(enabled, egui::RadioButton::new(selected == true, "")).clicked() {
-                                                                selected = true
-                                                            };
-                                                        };
-                                                        let mut label = ui.label(option.name.clone());
+                                                            let checkbox = ui.add_enabled(enabled, egui::RadioButton::new(selected, ""));
+                                                            if checkbox.hovered() {
+                                                                input_data.display = (gi, oi);
+                                                            }
+                                                            if checkbox.clicked() {
+                                                                selected = true;
+                                                            }
+                                                        }
+
+                                                        let mut label = ui.label(name);
                                                         label.sense = egui::Sense::click();
                                                         if label.hovered() {
-                                                            input_data.display = (gi, oi)
+                                                            input_data.display = (gi, oi);
                                                         }
                                                         if label.clicked() {
                                                             if group_type == WizardGroupType::All || group_type == WizardGroupType::Any || group_type == WizardGroupType::AtLeastOne {
-                                                                selected = !selected
+                                                                selected = !selected;
                                                             } else {
-                                                                selected = true
+                                                                selected = true;
                                                             }
                                                         }
-                                                        if selected != option.selected.clone() {
-                                                            //CURRENT 2: change selected, make sure to follow type requirements
+
+                                                        if selected != old_selected {
+                                                            if group_type == WizardGroupType::ExactlyOne || group_type == WizardGroupType::AtMostOne {
+                                                                for other in &mut group.options {
+                                                                    other.selected = false;
+                                                                }
+                                                            }
+                                                            group.options[oi].selected = selected;
+                                                            update_flags = true;
                                                         }
                                                     });
                                                 }
                                                 ui.separator();
+                                            }
+                                            if update_flags {
+                                                calculate_flags(input_data, false);
                                             }
                                         });
                                     });
@@ -1095,7 +1192,33 @@ impl eframe::App for SuperPatchApp {
                                     }
                                     if *input_data.track.last().unwrap() == -1 {
                                         if ui.button("Install").clicked() {
-                                            //CURRENT 2: Install the wizard selections
+                                            let mut install_roots: Vec<(String, String, usize)> = Vec::new();
+                                            install_roots.extend(input_data.init_roots.clone());
+                                            for i in &input_data.track {
+                                                if *i == -1 {break;}
+                                                let page_index = *i as usize;
+                                                for group in &input_data.pages[page_index].groups {
+                                                    for option in &group.options {
+                                                        install_roots.extend(option.roots_always.clone());
+                                                        if option.active_type == OptionAffectType::Allowed || option.active_type == OptionAffectType::Required {
+                                                            install_roots.extend(option.roots_available.clone());
+                                                        }
+                                                        if option.selected {
+                                                            install_roots.extend(option.roots.clone());
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            for conditionalroot in &input_data.conditional_roots {
+                                                if conditionalroot.active {
+                                                    install_roots.extend(conditionalroot.roots.clone())
+                                                }
+                                            }
+                                            install_roots.sort_by_key(|x| x.2);
+                                            let final_roots: Vec<(String, String)> = install_roots.into_iter().map(|(a, b, _)| (a, b)).collect();
+                                            let copy_archive = self.settings["copy_archive"].as_bool().unwrap_or(true);
+                                            let delete_archive = self.settings["delete_archive"].as_bool().unwrap_or(true);
+                                            self.livedata.install_modal_install_data = Some(InstallModalInstallData { root_list: final_roots, remove_list: Vec::new(), copy_archive, delete_archive, name: input_data.name.clone(), version: input_data.version.clone(), website: input_data.website.clone(), category: String::new(), specific_index: self.livedata.install_modal_requested_install_index, specific_index_target: self.livedata.install_modal_requested_install_index_target.clone()});
                                         }
                                     } else if ui.button("Next").clicked() {
                                         calculate_flags(input_data, true);
@@ -1331,6 +1454,7 @@ impl eframe::App for SuperPatchApp {
                     //TODO General: Fix table sizing issues
                     //Underfill: Calculate new size upon window resizing relative to previous size.
                     //Overflow: ???
+                    let mut request_update = false;
                     let original_widths = self.settings["organize_widths"].as_array().cloned().unwrap_or_else(|| vec![Value::from(50.0), Value::from(200.0), Value::from(100.0), Value::from(100.0), Value::from(100.0)]);
                     TableBuilder::new(ui)
                     .sense(egui::Sense::click_and_drag())
@@ -1552,8 +1676,8 @@ impl eframe::App for SuperPatchApp {
                                         }
                                     }
                                     self.orderdata.as_array_mut().unwrap().remove(priority as usize);
-                                    self.update_all();
                                     *self.status.lock().unwrap() = "Deleted mod.".to_string();
+                                    request_update = true;
                                 }
                                 let archive_exists = matches!(self.orderdata.get(priority as usize).unwrap_or(&Value::Null).get("archive").unwrap_or(&Value::Null), Value::String(string) if !string.is_empty());
                                 if ui.add_enabled(archive_exists, egui::Button::new("Reinstall mod")).clicked() {  
@@ -1595,6 +1719,9 @@ impl eframe::App for SuperPatchApp {
                             });
                         });
                     });
+                    if request_update {
+                        self.update_all();
+                    }
                     //MARK: Drag and Drop
                     if egui::DragAndDrop::has_payload_of_type::<i64>(ui.ctx()) {
                         let payload = *egui::DragAndDrop::payload::<i64>(ui.ctx()).unwrap();
@@ -2309,6 +2436,7 @@ fn archive_extract(archive_path: PathBuf, target_path: PathBuf, root_list: Vec<(
 fn parse_file_list(
     doc: &Document,
     file_list_node: NodeId,
+    root: String
 ) -> (Vec<(String, String, usize)>, Vec<(String, String, usize)>, Vec<(String, String, usize)>) {
     let mut roots = Vec::new();
     let mut roots_always = Vec::new();
@@ -2318,7 +2446,7 @@ fn parse_file_list(
     let nodes = result.as_node_set().unwrap();
 
     for &node in nodes {
-        let source = evaluate(doc, node, "string(@source)").unwrap().to_string();
+        let source = [root.clone(), evaluate(doc, node, "string(@source)").unwrap().to_string()].concat();
 
         let dest_raw = evaluate(doc, node, "string(@destination)").unwrap().to_string();
         let destination = if dest_raw.is_empty() { source.clone() } else { dest_raw };
@@ -2345,12 +2473,12 @@ fn parse_file_list(
 }
 
 //SLOP
-pub fn parse_file_list_flat(doc: &Document, file_list_node: NodeId) -> Vec<(String, String, usize)> {
+pub fn parse_file_list_flat(doc: &Document, file_list_node: NodeId, root: String) -> Vec<(String, String, usize)> {
     let result = evaluate(doc, file_list_node, "file | folder").unwrap();
     let nodes = result.as_node_set().unwrap();
 
     nodes.iter().map(|&node| {
-        let source = evaluate(doc, node, "string(@source)").unwrap().to_string();
+        let source = [root.clone(), evaluate(doc, node, "string(@source)").unwrap().to_string()].concat();
         let dest_raw = evaluate(doc, node, "string(@destination)").unwrap().to_string();
         let destination = if dest_raw.is_empty() { source.clone() } else { dest_raw };
         let priority: usize = evaluate(doc, node, "string(@priority)").unwrap().to_string().parse().unwrap_or(0);
@@ -2392,6 +2520,7 @@ fn parse_flags(doc: &Document, flags_list: &Vec<NodeId>) -> Vec<(String, String)
     for &flag in flags_list {
         let name = evaluate(doc, flag, "string(@name)").unwrap().to_string();
         let value = doc.text_content(flag);
+        println!("Parse added flag {}: {}", name, value);
         flags.push((name, value));
     }
     flags
@@ -2408,7 +2537,6 @@ fn calculate_flags(data: &mut WizardInstallData, advance: bool) {
     let mut total_flags = HashMap::<String,String>::new();
     let mut iter_track = data.track.clone();
     iter_track.pop();
-    iter_track.pop();
     for index in iter_track {
         for group in &data.pages[index as usize].groups {
             for option in &group.options {
@@ -2422,11 +2550,12 @@ fn calculate_flags(data: &mut WizardInstallData, advance: bool) {
     }
     let mut next_page_index = -1;
     let start: usize = data.track[data.track.len() - 2].try_into().unwrap();
-    for index in (start+1)..data.pages.len() {
+    for index in start..data.pages.len() {
         let page = &mut data.pages[index];
         let active = flag_check(page.aff_com.clone(), total_flags.clone());
-        if active {
+        if active || index == start {   
             for group in &mut page.groups {
+                let mut any_selected = group.options.par_iter().any(|entry| entry.selected);
                 for option in &mut group.options {
                     let mut active_type  = option.default_type.clone();
                     if group.group_type == WizardGroupType::All {
@@ -2445,13 +2574,26 @@ fn calculate_flags(data: &mut WizardInstallData, advance: bool) {
                     if active_type == OptionAffectType::Disallowed {
                         option.selected = false;
                     }
+                    if active_type == OptionAffectType::Allowed && !any_selected {
+                        if group.group_type == WizardGroupType::AtLeastOne || group.group_type == WizardGroupType::ExactlyOne {
+                            option.selected = true;
+                            any_selected  = true;
+                        }
+                    }
                     option.active_type = active_type;
                 }
             }
-            next_page_index = index as i32;
-            break;
+            if index != start {
+                next_page_index = index as i32;
+                break;
+            }
         }
     }
+    //CHECK Mods: Untested
+    for conditionalinstall in &mut data.conditional_roots {
+        conditionalinstall.active = flag_check(conditionalinstall.aff_com.clone(), total_flags.clone());
+    }
+
     let len = data.track.len();
     data.track[len-1] = next_page_index;
 }
