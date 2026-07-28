@@ -124,9 +124,6 @@ struct LiveData {
     install_modal_install_data: Option<InstallModalInstallData>,
     install_modal_requested_install_index: usize,
     install_modal_requested_install_index_target: SpecificIndexTarget,
-    text_input_modal_open: bool,
-    text_input_modal_type: TextInputType,
-    text_input_modal_value: String,
     settingsedit_type: SettingsEditType,
     settingsedit_value: String,
     organizeedit_type: OrganizeSortEditType,
@@ -148,7 +145,6 @@ enum TextInputType {
 enum InstallModalType {
     None,
     Manual,
-    Skip,
     Select,
     Wizard
 }
@@ -156,9 +152,14 @@ enum InstallModalType {
 enum InstallModalInputData {
     None,
     Manual(ManualInstallData),
-    Wizard(WizardInstallData)
+    Wizard(WizardInstallData),
+    Select(SelectInstallData)
 }
-
+#[derive(Clone, PartialEq)]
+struct SelectInstallData {
+    root_list: Vec<(String, bool)>,
+    remove: Option<String>
+}
 #[derive(Clone, PartialEq)]
 struct ManualInstallData {
     display_path: String,
@@ -358,9 +359,6 @@ impl SuperPatchApp {
                 install_modal_install_data: None,
                 install_modal_requested_install_index: 0,
                 install_modal_requested_install_index_target: SpecificIndexTarget::Last,
-                text_input_modal_open: false,
-                text_input_modal_type: TextInputType::None,
-                text_input_modal_value: String::new(),
                 settingsedit_type: SettingsEditType::None,
                 settingsedit_value: String::new(),
                 organizeedit_type: OrganizeSortEditType::None,
@@ -397,14 +395,13 @@ impl SuperPatchApp {
         self.livedata.install_modal_vfs_data = Some(scan_archive(&self.livedata.install_modal_path))
     }
     fn check_mod_type(&mut self) {
-        //TODO Mods: Detect selectors and skips
+        self.livedata.install_modal_root = String::new();
 
         if self.livedata.install_modal_vfs_data.as_ref().unwrap().contains_key("fomod") {
             self.livedata.install_modal_type = InstallModalType::Wizard;
-            self.livedata.install_modal_root = String::new();
             return;
         }
-        //Allow fomod in other root (suprisingly difficult!)
+        //if one folder
         if self.livedata.install_modal_vfs_data.as_ref().unwrap().len() == 1 {
             let mainfolder = self.livedata.install_modal_vfs_data.as_ref().unwrap().first_key_value().unwrap();
             if let ArchiveVFSNode::Dir(mainfoldertree) = mainfolder.1 {
@@ -412,16 +409,71 @@ impl SuperPatchApp {
                     self.livedata.install_modal_type = InstallModalType::Wizard;
                     self.livedata.install_modal_root = [mainfolder.0.to_string(), "/".to_string()].concat();
                     return;
+                } else if mainfoldertree.contains_key("gamedata") || mainfoldertree.contains_key("appdata") {
+                    if mainfoldertree.contains_key("optional") || mainfoldertree.contains_key("opt") {
+                        self.livedata.install_modal_type = InstallModalType::Select;
+                        self.livedata.install_modal_root = [mainfolder.0.to_string(), "/".to_string()].concat();
+                        return;
+                    }
+                    else {
+                        self.livedata.install_modal_type = InstallModalType::Manual;
+                        let (name, version) = parse_archive_name(self.livedata.install_modal_path.file_stem().unwrap().to_str().unwrap());
+                        let copy_archive = self.settings["copy_archive"].as_bool().unwrap_or(true);
+                        let delete_archive = self.settings["delete_archive"].as_bool().unwrap_or(true);
+                        self.livedata.install_modal_install_data = Some(InstallModalInstallData { root_list: vec![(mainfolder.0.to_string(),String::new())], remove_list: Vec::new(), copy_archive, delete_archive, name: name.clone(), version, category: String::new(), specific_index: self.livedata.install_modal_requested_install_index, specific_index_target: self.livedata.install_modal_requested_install_index_target.clone(), website: String::new()});
+                        return;
+                    }
+                }
+                let mut matches = 0;
+                while matches < 2 {
+                    for folder in mainfoldertree.iter() {
+                        if let ArchiveVFSNode::Dir(foldertree) = folder.1 {
+                            if foldertree.contains_key("gamedata") || foldertree.contains_key("appdata") {
+                                matches += 1;
+                            }
+                        }
+                    }
+                    break;
+                }
+                if !matches < 2 {
+                    self.livedata.install_modal_type = InstallModalType::Select;
+                    self.livedata.install_modal_root = [mainfolder.0.to_string(), "/".to_string()].concat();
+                    return;
                 }
             }
         }
-        //One root, skip
+        if self.livedata.install_modal_vfs_data.as_ref().unwrap().contains_key("gamedata") || self.livedata.install_modal_vfs_data.as_ref().unwrap().contains_key("gamedata") {
+            if self.livedata.install_modal_vfs_data.as_ref().unwrap().contains_key("optional") || self.livedata.install_modal_vfs_data.as_ref().unwrap().contains_key("opt") {
+                self.livedata.install_modal_type = InstallModalType::Select;
+                return;
+            }
+            else {
+                self.livedata.install_modal_type = InstallModalType::Manual;
+                let (name, version) = parse_archive_name(self.livedata.install_modal_path.file_stem().unwrap().to_str().unwrap());
+                let copy_archive = self.settings["copy_archive"].as_bool().unwrap_or(true);
+                let delete_archive = self.settings["delete_archive"].as_bool().unwrap_or(true);
+                self.livedata.install_modal_install_data = Some(InstallModalInstallData { root_list: vec![(String::new(), String::new())], remove_list: Vec::new(), copy_archive, delete_archive, name: name.clone(), version, category: String::new(), specific_index: self.livedata.install_modal_requested_install_index, specific_index_target: self.livedata.install_modal_requested_install_index_target.clone(), website: String::new()});
+                return;
+            }
+        }
 
-        //Multiple roots, selector
-            //All in one root (BAIN included)
-            //Optional
+        let mut matches = 0;
+        while matches < 2 {
+            for folder in self.livedata.install_modal_vfs_data.as_ref().unwrap().iter() {
+                if let ArchiveVFSNode::Dir(foldertree) = folder.1 {
+                    if foldertree.contains_key("gamedata") || foldertree.contains_key("appdata") {
+                        matches += 1;
+                    }
+                }
+            }
+            break;
+        }
+        if matches > 1 {
+            self.livedata.install_modal_type = InstallModalType::Select;
+            return;
+        }
 
-        //Manual installer
+        //manual
         self.livedata.install_modal_type = InstallModalType::Manual;
     }
     fn install_modal_update_input_data_manual(&mut self) {
@@ -475,6 +527,54 @@ impl SuperPatchApp {
             data.display_list.push(new_entry);
         };
         self.livedata.install_modal_input_data = InstallModalInputData::Manual(data)
+    }
+    fn install_modal_create_select_data_wizard(&mut self) {
+        let mut root_list: Vec<(String, bool)> = Vec::new();
+        let mut remove: Option<String> = None;
+        if self.livedata.install_modal_vfs_data.as_ref().unwrap().len() == 1 {
+            let mainfolder = self.livedata.install_modal_vfs_data.as_ref().unwrap().first_key_value().unwrap();
+            if let ArchiveVFSNode::Dir(mainfoldertree) = mainfolder.1 {
+                if mainfoldertree.contains_key("gamedata") || mainfoldertree.contains_key("appdata") { 
+                    if mainfoldertree.contains_key("optional") || mainfoldertree.contains_key("opt") {
+                        remove = Some("optional".to_string());
+                        root_list.push((mainfolder.0.to_string(), false));
+                        for folder in mainfoldertree {
+                            if let ArchiveVFSNode::Dir(_) = folder.1 {
+                                root_list.push(([mainfolder.0, "/", folder.0].concat(), false))
+                            }
+                        }       
+                    } else {
+                        panic!()
+                    }
+                } else {
+                    for folder in mainfoldertree {
+                        if let ArchiveVFSNode::Dir(_) = folder.1 {
+                            root_list.push(([mainfolder.0, "/", folder.0].concat(), false))
+                        }
+                    }     
+                }
+            } else {panic!()}
+        } else {
+        if self.livedata.install_modal_vfs_data.as_ref().unwrap().contains_key("gamedata") || self.livedata.install_modal_vfs_data.as_ref().unwrap().contains_key("gamedata") {
+            if self.livedata.install_modal_vfs_data.as_ref().unwrap().contains_key("optional") {
+                remove = Some("optional".to_string());
+                root_list.push((String::new(), false));
+                for folder in self.livedata.install_modal_vfs_data.as_ref().unwrap() {
+                    if let ArchiveVFSNode::Dir(_) = folder.1 {
+                        root_list.push((folder.0.to_string(), false))
+                    }
+                } 
+            } else {
+                panic!()
+            }
+        }
+            for folder in self.livedata.install_modal_vfs_data.as_ref().unwrap() {
+                if let ArchiveVFSNode::Dir(_) = folder.1 {
+                    root_list.push((folder.0.to_string(), false))
+                }
+            } 
+        }
+        self.livedata.install_modal_input_data = InstallModalInputData::Select(SelectInstallData { root_list, remove })
     }
     fn install_modal_create_input_data_wizard(&mut self) {
         //FOMOD data (https://stepmodifications.org/wiki/Guide:FOMOD) (https://fomod-docs.readthedocs.io/en/latest/specs.html)
@@ -733,7 +833,8 @@ impl SuperPatchApp {
         if install_data.delete_archive {
             fs::remove_file(self.livedata.install_modal_path.clone()).expect("Failed to delete archive");
         }
-        //TODO Mods: Save root_list and remove_list for modpack use.
+        let root_list = serde_json::to_value(install_data.root_list.clone()).unwrap();
+        let remove_list = serde_json::to_value(install_data.remove_list.clone()).unwrap();
         let entry = json!({
             "enabled": true,
             "name": install_data.name,
@@ -741,7 +842,9 @@ impl SuperPatchApp {
             "version": install_data.version,
             "category": install_data.category,
             "archive": archive_path,
-            "website": install_data.website
+            "website": install_data.website,
+            "root_list": root_list,
+            "remove_list": remove_list
         });
         match install_data.specific_index_target {
             SpecificIndexTarget::Replace => {
@@ -816,7 +919,8 @@ impl SuperPatchApp {
             .replace("%path%", real_vfs_path.to_str().unwrap_or(""));
         *status.lock().unwrap() = "Launching game.".to_string();
         //TODO Launch: Display error message if the command fails to launch the game.
-        //TODO Launch: This won't work on windows.
+        //TODO Launch: This won't work on windows. also scuffed.
+        println!("Starting process w/command: {}", game_command);
         let _ = Command::new("sh")
             .arg("-c")
             .arg(game_command)
@@ -857,18 +961,22 @@ impl eframe::App for SuperPatchApp {
                 save_settings(self.settings.clone());
             }
         }
-        //TODO Tools: Initial setup modal for first time users.
+        //MARK: Setup Modal
+        //TODO Tools: Initial setup modal for first time users. (for real)
         //If you on windows, https://neacsu.net/posts/win_symlinks/
         if !self.settings["initialized"].as_bool().unwrap_or(false) {
             let initial_modal = Modal::new(Id::new("initial_modal")).show(ui.ctx(), |ui| {
                 ui.heading("Initial Setup");
-                ui.label("This feature is not yet implemented.");
+                ui.label("hi if you are on windows you need to make sure symlinks are enabled: https://neacsu.net/posts/win_symlinks/. \n before you can install mods, you need a path and command to run the game. if you don't already have the game, go to tools > install game. if you do, edit the game path and command section to match that. if you're on linux, use the proton setup to get a proton command.");
             });
             if initial_modal.should_close() {
                 self.settings["initialized"] = Value::Bool(true);
                 save_settings(self.settings.clone());
             }
         }
+        //MARK: Game Modal
+        //TODO Tools: Install game modal
+
         //MARK: Wine Modal
         //TODO Tools: Install / detect wine or proton and set up wineprefix for the game. (Linux only)
         //GET WINE
@@ -907,6 +1015,10 @@ impl eframe::App for SuperPatchApp {
             }
         }
         //MARK: Import Modal
+        //TODO Tools: Import modpack
+        //MARK: Export Modal
+        //TODO Tools: Export modpack
+        //MARK: MO2 Import Modal
         //TODO Tools: Import from MO2
         //Modal
         //MO2 Path
@@ -942,6 +1054,7 @@ impl eframe::App for SuperPatchApp {
                         match self.livedata.install_modal_type {
                             InstallModalType::Manual => {self.install_modal_update_input_data_manual()}
                             InstallModalType::Wizard => {self.install_modal_create_input_data_wizard()}
+                            InstallModalType::Select => {self.install_modal_create_select_data_wizard()}
                             _ => panic!()
                         }
                     }
@@ -955,7 +1068,6 @@ impl eframe::App for SuperPatchApp {
                                 };
                                 let mut needs_update = false;
                                 ui.label("Mod type not detected. Please manually select files.");
-                                //TODO Mods: Top 10 Puzzles of all time
                                 ui.label("R: Root, X: Excluded, +: Included by proxy, -: Excluded by proxy");
                                 ui.separator();
                                 ui.vertical(|ui| { 
@@ -1225,8 +1337,30 @@ impl eframe::App for SuperPatchApp {
                                         input_data.display = (0,0);
                                     }
                                 });
+                            },
+                            InstallModalType::Select => {
+                                let input_data = match &mut self.livedata.install_modal_input_data {
+                                    InstallModalInputData::Select(data) => data,
+                                    _ => panic!()
+                                };
+                                egui::ScrollArea::vertical().max_width(250.0).max_height(500.0).auto_shrink(false).show(ui, |ui| {
+                                    for selector in &mut input_data.root_list {
+                                        ui.horizontal(|ui| {
+                                            ui.checkbox(&mut selector.1, "");
+                                            ui.label(selector.0.clone());
+                                        });
+                                    }
+                                });
+                                ui.separator();
+                                if ui.add_enabled(input_data.root_list.iter().any(|a| a.1), egui::Button::new("Proceed to Installation")).clicked() {
+                                    let (name, version) = parse_archive_name(self.livedata.install_modal_path.file_stem().unwrap().to_str().unwrap());
+                                    let copy_archive = self.settings["copy_archive"].as_bool().unwrap_or(true);
+                                    let delete_archive = self.settings["delete_archive"].as_bool().unwrap_or(true);
+                                    let remove_list = if input_data.remove.is_some() {vec![input_data.remove.clone().unwrap()]} else {Vec::new()};
+                                    let root_list: Vec<(String, String)> = input_data.root_list.iter().filter(|a| a.1).map(|(a,b)| (a.to_string(), String::new())).collect();
+                                    self.livedata.install_modal_install_data = Some(InstallModalInstallData { root_list, remove_list, copy_archive, delete_archive, name: name.clone(), version, category: String::new(), specific_index: self.livedata.install_modal_requested_install_index, specific_index_target: self.livedata.install_modal_requested_install_index_target.clone(), website: String::new()})
+                                }
                             }
-                            //TODO Mods: Implement selectors
                             _ => {ui.close()}
                         }
 
@@ -1240,7 +1374,7 @@ impl eframe::App for SuperPatchApp {
                         ui.label("Roots:");
                         for i in install_data.root_list.clone() {
                             if i.0.is_empty() {
-                                ui.label("[Archive Root");
+                                ui.label("[Archive Root]");
                             } else {
                                 ui.label(i.0);
                             }
@@ -1298,24 +1432,14 @@ impl eframe::App for SuperPatchApp {
                 self.livedata.install_modal_requested_install_index_target = SpecificIndexTarget::Last;
             }
         }
-        //MARK: Text input modal
-        //TODO General: General purpose text input modal
-        if self.livedata.text_input_modal_open {
-            let text_input_modal = Modal::new(Id::new("text_input_modal")).show(ui.ctx(), |ui| {
-                ui.heading("Text Input");
-                ui.label("This feature is not yet implemented.");
-            });
-            if text_input_modal.should_close() {
-                self.livedata.text_input_modal_open = false;
-            }
-        }
         //MARK: Menu Bar
         egui::Panel::top("top_bar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
                 ui.menu_button("File", |ui| {
-                    if ui.button("Import").clicked() {
+                    if ui.button("Import from MO2").clicked() {
                         self.livedata.import_modal_open = true;
                     }
+                    ui.button("Import Modpack");
                     if ui.button("Add mod").clicked() {
                         let path = pick_mod_file();
                         if let Some(path_full) = path {
@@ -1341,10 +1465,13 @@ impl eframe::App for SuperPatchApp {
                         if ui.button("Setup Wine").clicked() {
                             self.livedata.wine_modal_open = true;
                         }
-                        if ui.button("Install Modded EXEs").clicked() {
-                            self.livedata.modded_exes_modal_open = true;
-                        }
                     }
+                    if ui.button("Install Modded EXEs").clicked() {
+                        self.livedata.modded_exes_modal_open = true;
+                    }
+                    ui.button("Export Modpack");
+                    ui.button("Setup Modal");
+                    ui.button("Install Game");
                 });
             });
         });
@@ -1629,7 +1756,6 @@ impl eframe::App for SuperPatchApp {
                                         self.update_all();
                                     }
                                 }
-                                //TODO Mods: Drag and drop mods
                             }
                             response.context_menu(|ui| {
                                 if ui.button(if enabled { "Disable" } else { "Enable" }).clicked() {
@@ -1714,7 +1840,7 @@ impl eframe::App for SuperPatchApp {
                                     ui.close();
                                 }
                                 if ui.button("Properties").clicked() {
-                                    //TODO General: Properties Modal.
+                                    //TODO Mods: Properties Modal.
                                 }
                             });
                         });
@@ -2248,7 +2374,7 @@ fn link_vfs_data_recursive(vfsdata: VFSTree, origin_path: &Path, patchdata: Valu
         let new_path = origin_path.join(&key);
         if let VFSNode::File(file) = value {
             let source_path = file.paths.iter().next_back().unwrap().1;
-            link_that_file(&PathBuf::from(source_path), &new_path);
+            link_that_file(&PathBuf::from(source_path).canonicalize().unwrap(), &new_path);
         } else if let VFSNode::Dir(children) = value {
             fs::create_dir_all(&new_path).expect("Failed to create directory");
             link_vfs_data_recursive(children, origin_path, patchdata.clone());
@@ -2374,7 +2500,6 @@ fn archive_extract(archive_path: PathBuf, target_path: PathBuf, root_list: Vec<(
                     let mut output_path = target_path.clone();
                     output_path.push(&extract_goahead.2);
                     output_path.push(entry.file_name());
-                    println!("Moving {} to {} ({} + {} + {})", entry.name(), output_path.to_string_lossy().to_string(), target_path.clone().to_string_lossy().to_string(), extract_goahead.2, entry.file_name());
                     listfile_vec.push((normalize_sep(entry.name()), output_path));
                 }
             }
@@ -2450,8 +2575,7 @@ fn parse_file_list(
     for &node in nodes {
         let source = [root.clone(), evaluate(doc, node, "string(@source)").unwrap().to_string()].concat();
 
-        let dest_raw = evaluate(doc, node, "string(@destination)").unwrap().to_string();
-        let destination = if dest_raw.is_empty() { source.clone() } else { dest_raw };
+        let destination = evaluate(doc, node, "string(@destination)").unwrap().to_string();
 
         let priority_raw = evaluate(doc, node, "string(@priority)").unwrap().to_string();
         let priority: usize = priority_raw.parse().unwrap_or(0);
@@ -2721,7 +2845,6 @@ fn parent_in_tf_list(search: &str, false_list: &Vec<String>, true_list: &Vec<(St
             let norm_src = normalize_sep(matched_src);
             let norm_search = normalize_sep(search);
             let rel = pathdiff(&norm_search, &norm_src);
-            debug_assert_ne!(rel, norm_search, "strip_prefix failed: {} is not prefixed by {}", norm_search, norm_src);
             let return_dir = Path::new(matched_dst)
                 .join(&rel)
                 .parent()

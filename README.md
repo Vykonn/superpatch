@@ -1,6 +1,6 @@
 # Superpatch
 
-\#hype mod manager designed for [S.T.A.L.K.E.R Anomaly](https://www.moddb.com/mods/stalker-anomaly). Made in \#rust (\#blazinglyfast.) Much faster than Mod Organizer 2. It's also cross-platform. And it has some other features that I think are useful.
+\#hype mod manager designed for [S.T.A.L.K.E.R Anomaly](https://www.moddb.com/mods/stalker-anomaly). Made in \#rust (\#blazinglyfast.) Much faster than Mod Organizer 2. (except for extracting solid 7z files.) It's also cross-platform. And it has some other features that I think are useful.
 
 ## Tools
 
@@ -24,7 +24,7 @@ I haven't done this yet.
 
 Wondering why it's called Super"patch"? (terrible name btw.) It's because of this! I was originally just going to make a plugin for MO2. But it didn't seem feasible. So I made my own mod manager! In my opinion, S.T.A.L.K.E.R. modding suffers from constant CONFLICTS and PATCHES. It's really terrible. DLTX patches can be helpful, but they really seem like a bandaid on a dam. Many mods try to deal with conflicts by patching over files and implementing their new behavior AND the mod that they PRESUME you have's intended behavior. What if you have THREE mods that modify the same file? Well, you better hope one of them implements the behavior of all three in a patch. This can get much more out of hand. So! that is where this comes in hand. 
 
-You (will in the future soon be able to and do by doing this) can select a file with conflicts in the File menu and open it in the Patch menu. Now, you can see a list of all the various sources for the files from many mods. You can also see DLTX patches! And then you can like... see the hashes of the files and then like make a master patch or something that... it's still in progress. See PLAN.md if you really care about my ideas.
+You (will in the future soon be able to and do by doing this) can select a file with conflicts in the File menu and open it in the Patch menu. Now, you can see a list of all the various sources for the files from many mods. You can also see DLTX patches! And then you can like... see the hashes of the files and then like make a master patch or something that... it's still in progress. See PLAN.md if you really care about my ideas. TBD.
 
 ## Transferability
 
@@ -43,15 +43,15 @@ Here's a folder structure for your reference.
 - .saved/ - This is YOUR save data. I would reccomend keeping it. But you probably don't need to share it with others.
 - .vfs/ - This is the instance's temporary folder where the game actually runs. You don't need to share this. You can also probably delete this at will, as it's generated on launch! With exception. This MAY contain your save data if new files appear and the changes have not been saved to .saved/. To avoid this, make sure to Save VFS Changes in the File menu before deleting it. Also, don't delete it while the game is running. Duh.
 
-Now, that's a little complicated. I should probably make another project for sharing modpacks.. And installing superpatch. And installing the game with it. Put that in the list.
+Now, that's a little complicated. I should probably make another project for sharing modpacks.. And installing superpatch. And installing the game with it. Put that in the list. Or just add a tool to install the game and modpack export/import feature. but how would it be exported? weblinks? those aren't exactly guaranteed to work. what if something changes? a big archive may be too big though. blah blah blah.. TBD.
 
 ## Install
 
-You probably want an install! Uhh.. Give me some time. It's not done.
+You probably want an install! Uhh.. Give me some time. It's not done. cargo build prolly?
 
 ## A note on this project
 
-This was made in rust, a language that I have never used before. Why? Why not! I am quite terrible with organizing code in any language, so as of the time of writing, there is ONE file of code. 2000 lines and counting.
+This was made in rust, a language that I have never used before. Why? Why not! I am quite terrible with organizing code in any language, so as of the time of writing, there is ONE file of code. 2000 lines and counting. Also, as of now, there is VERY POOR error handling. If ANYTHING goes wrong, the whole thing will crash. Pretty safe though!
 
 Neither am I the greatest at issue management. All of the current issues that I know about are in the source code, either in TODO or FIXME blocks. This will probably be replaced by Github issues once this project is in a fully-functional state, but for now, don't expect the greatest help.
 
