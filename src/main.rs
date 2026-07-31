@@ -112,10 +112,7 @@ struct VFSFile {
 }
 #[derive(Clone)]
 struct LiveData {
-    wine_modal_open: bool,
-    modded_exes_modal_open: bool,
-    import_modal_open: bool,
-    install_modal_open: bool,
+    modal_open: ModalType,
     install_modal_path: PathBuf,
     install_modal_type: InstallModalType,
     install_modal_root: String,
@@ -129,6 +126,18 @@ struct LiveData {
     organizeedit_type: OrganizeSortEditType,
     organizeedit_index: usize,
     organizeedit_value: String,
+}
+#[derive(Clone, PartialEq)]
+enum ModalType {
+    None,
+    Install,
+    ImportMO2,
+    Import,
+    Export,
+    Modded,
+    Proton,
+    Game,
+    Setup
 }
 type ArchiveVFSTree = BTreeMap<String, ArchiveVFSNode>;
 #[derive(Clone)]
@@ -347,10 +356,7 @@ impl SuperPatchApp {
             vfssort_list_refresh_requested: false,
             patchdata,
             livedata: LiveData {
-                wine_modal_open: false,
-                modded_exes_modal_open: false,
-                import_modal_open: false,
-                install_modal_open: false,
+                modal_open: ModalType::None,
                 install_modal_path: PathBuf::new(),
                 install_modal_type: InstallModalType::None,
                 install_modal_root: String::new(),
@@ -918,14 +924,21 @@ impl SuperPatchApp {
             .unwrap_or("")
             .replace("%path%", real_vfs_path.to_str().unwrap_or(""));
         *status.lock().unwrap() = "Launching game.".to_string();
-        //TODO Launch: Display error message if the command fails to launch the game.
-        //TODO Launch: This won't work on windows. also scuffed.
-        println!("Starting process w/command: {}", game_command);
-        let _ = Command::new("sh")
-            .arg("-c")
-            .arg(game_command)
-            .spawn();
-        *status.lock().unwrap() = "Launched game.".to_string();
+        match parse_command(&game_command) {
+            Ok((env, cmd, args)) => {
+                let mut command = Command::new(&cmd);
+                command.args(args);
+                for (k, v) in env {
+                        command.env(k, v);
+                }
+                match command.spawn() {
+                    Ok(_) => {*status.lock().unwrap() = "Launched game.".to_string();}
+                    Err(e) => {*status.lock().unwrap() = format!("Failed to launch game, error {}", e); eprintln!("Failed command: {}", cmd)}
+                };
+            }
+            Err(e) => {*status.lock().unwrap() = format!("Failed to launch game, error {}", e);}
+        }
+        
         });
     }
 }
@@ -965,76 +978,105 @@ impl eframe::App for SuperPatchApp {
         //TODO Tools: Initial setup modal for first time users. (for real)
         //If you on windows, https://neacsu.net/posts/win_symlinks/
         if !self.settings["initialized"].as_bool().unwrap_or(false) {
+            self.settings["initialized"] = Value::Bool(true);
+            self.livedata.modal_open = ModalType::Setup;
+        }
+        if self.livedata.modal_open == ModalType::Setup {
             let initial_modal = Modal::new(Id::new("initial_modal")).show(ui.ctx(), |ui| {
                 ui.heading("Initial Setup");
                 ui.label("hi if you are on windows you need to make sure symlinks are enabled: https://neacsu.net/posts/win_symlinks/. \n before you can install mods, you need a path and command to run the game. if you don't already have the game, go to tools > install game. if you do, edit the game path and command section to match that. if you're on linux, use the proton setup to get a proton command.");
             });
             if initial_modal.should_close() {
-                self.settings["initialized"] = Value::Bool(true);
                 save_settings(self.settings.clone());
             }
         }
         //MARK: Game Modal
         //TODO Tools: Install game modal
-
+        if self.livedata.modal_open == ModalType::Game {
+            let modded_exes_modal = Modal::new(Id::new("game_modal")).show(ui.ctx(), |ui| {
+                ui.heading("Install Game");
+                ui.label("This feature is not yet implemented.");
+            });
+            if modded_exes_modal.should_close() {
+                self.livedata.modal_open = ModalType::None;
+            }
+        }
         //MARK: Wine Modal
         //TODO Tools: Install / detect wine or proton and set up wineprefix for the game. (Linux only)
         //GET WINE
         //Getting wine: Is steam installed?
-        //Yes: Is a version of proton above 10.0 installed?
-        //Yes: Use that.
-        //No: Install proton 10.0.
-        //No: Is wine installed?
-        //Yes: Use that.
-        //No: Install wine.
+            //Yes: Is a version of proton above 10.0 installed?
+                //Yes: Use that.
+                //No: Install proton 10.0.
+            //No: Is wine installed?
+                //Yes: Use that.
+                //No: Install wine.
         //Prefix setup:
         //Create new prefix.
         //Get winetricks
         //Install cmd d3dcompiler_47 d3dx10 d3dx11_43 d3dx9 dx8vb quartz vcrun2022 dxvk
         #[cfg(target_os = "linux")]
         {
-            if self.livedata.wine_modal_open {
+            if self.livedata.modal_open == ModalType::Proton {
                 let wine_modal = Modal::new(Id::new("wine_modal")).show(ui.ctx(), |ui| {
                     ui.heading("Wine Setup");
                     ui.label("This feature is not yet implemented.");
                 });
                 if wine_modal.should_close() {
-                    self.livedata.wine_modal_open = false;
+                    self.livedata.modal_open = ModalType::None;
                 }
             }
         }
         //MARK: Modded EXEs Modal
         //TODO Tools: Install latest modded EXEs.
-        if self.livedata.modded_exes_modal_open {
+        if self.livedata.modal_open == ModalType::Modded {
             let modded_exes_modal = Modal::new(Id::new("modded_exes_modal")).show(ui.ctx(), |ui| {
                 ui.heading("Install Modded EXEs");
                 ui.label("This feature is not yet implemented.");
             });
             if modded_exes_modal.should_close() {
-                self.livedata.modded_exes_modal_open = false;
+                self.livedata.modal_open = ModalType::None;
             }
         }
         //MARK: Import Modal
         //TODO Tools: Import modpack
+        if self.livedata.modal_open == ModalType::Import {
+            let import_modal = Modal::new(Id::new("import_modal")).show(ui.ctx(), |ui| {
+                ui.heading("Import Modpack");
+                ui.label("This feature is not yet implemented.");
+            });
+            if import_modal.should_close() {
+                self.livedata.modal_open = ModalType::None;
+            }
+        }
         //MARK: Export Modal
         //TODO Tools: Export modpack
+        if self.livedata.modal_open == ModalType::Export {
+            let import_modal = Modal::new(Id::new("export_modal")).show(ui.ctx(), |ui| {
+                ui.heading("Export Modpack");
+                ui.label("This feature is not yet implemented.");
+            });
+            if import_modal.should_close() {
+                self.livedata.modal_open = ModalType::None;
+            }
+        }
         //MARK: MO2 Import Modal
         //TODO Tools: Import from MO2
         //Modal
         //MO2 Path
         //Instance Path
         //Start/Cancel
-        if self.livedata.import_modal_open {
-            let import_modal = Modal::new(Id::new("import_modal")).show(ui.ctx(), |ui| {
+        if self.livedata.modal_open == ModalType::ImportMO2 {
+            let import_modal = Modal::new(Id::new("import_mo2_modal")).show(ui.ctx(), |ui| {
                 ui.heading("Import from MO2");
                 ui.label("This feature is not yet implemented.");
             });
             if import_modal.should_close() {
-                self.livedata.import_modal_open = false;
+                self.livedata.modal_open = ModalType::None;
             }
         }
         //MARK: Installation Modal
-        if self.livedata.install_modal_open {
+        if self.livedata.modal_open == ModalType::Install {
             let install_modal = Modal::new(Id::new("install_modal")).show(ui.ctx(), |ui| {
                 ui.style_mut().interaction.selectable_labels = false;
                 ui.heading("Install Mod");
@@ -1422,7 +1464,7 @@ impl eframe::App for SuperPatchApp {
                 }
             });
             if install_modal.should_close() {
-                self.livedata.install_modal_open = false;
+                self.livedata.modal_open = ModalType::None;
                 self.livedata.install_modal_path = PathBuf::new();
                 self.livedata.install_modal_type = InstallModalType::None;
                 self.livedata.install_modal_vfs_data = None;
@@ -1435,15 +1477,11 @@ impl eframe::App for SuperPatchApp {
         //MARK: Menu Bar
         egui::Panel::top("top_bar").show(ui, |ui| {
             egui::MenuBar::new().ui(ui, |ui| {
-                ui.menu_button("File", |ui| {
-                    if ui.button("Import from MO2").clicked() {
-                        self.livedata.import_modal_open = true;
-                    }
-                    ui.button("Import Modpack");
+                ui.menu_button("Main", |ui| {
                     if ui.button("Add mod").clicked() {
                         let path = pick_mod_file();
                         if let Some(path_full) = path {
-                            self.livedata.install_modal_open = true;
+                            self.livedata.modal_open = ModalType::Install;
                             self.livedata.install_modal_path = path_full;
                             self.livedata.install_modal_requested_install_index = 0;
                             self.livedata.install_modal_requested_install_index_target = SpecificIndexTarget::Last;
@@ -1463,15 +1501,27 @@ impl eframe::App for SuperPatchApp {
                     #[cfg(target_os = "linux")]
                     {
                         if ui.button("Setup Wine").clicked() {
-                            self.livedata.wine_modal_open = true;
+                            self.livedata.modal_open = ModalType::Proton;
                         }
                     }
                     if ui.button("Install Modded EXEs").clicked() {
-                        self.livedata.modded_exes_modal_open = true;
+                        self.livedata.modal_open = ModalType::Modded;
                     }
-                    ui.button("Export Modpack");
-                    ui.button("Setup Modal");
-                    ui.button("Install Game");
+                    if ui.button("Setup Modal").clicked() {
+                        self.livedata.modal_open = ModalType::Setup;
+                    };
+                    if ui.button("Install Game").clicked() {
+                        self.livedata.modal_open = ModalType::Game;
+                    }
+                    if ui.button("Export Modpack").clicked() {
+                        self.livedata.modal_open = ModalType::Export;
+                    }
+                    if ui.button("Import from MO2").clicked() {
+                        self.livedata.modal_open = ModalType::ImportMO2;
+                    }
+                    if ui.button("Import Modpack").clicked() {
+                        self.livedata.modal_open = ModalType::Import;
+                    }
                 });
             });
         });
@@ -1578,7 +1628,7 @@ impl eframe::App for SuperPatchApp {
             match self.selected_tab {
                 //MARK: Configuration Page
                 Tab::Organize => {
-                    //TODO General: Fix table sizing issues
+                    //FIXME General: Fix table sizing issues
                     //Underfill: Calculate new size upon window resizing relative to previous size.
                     //Overflow: ???
                     let mut request_update = false;
@@ -1683,7 +1733,7 @@ impl eframe::App for SuperPatchApp {
                                     *self.status.lock().unwrap() = if enabled { "Enabled mod.".to_string() } else { "Disabled mod.".to_string() };
                                 });
                             });
-                            //FIXME General: If you right click one of the labels it doesn't give you a right click menu.
+                            let mut responses = Vec::new();
                             for i in [("name", name, OrganizeSortEditType::Name), ("category", category, OrganizeSortEditType::Category), ("version", version, OrganizeSortEditType::Version)] {
                                 row.col(|ui| {
                                     if self.livedata.organizeedit_type == i.2
@@ -1700,6 +1750,7 @@ impl eframe::App for SuperPatchApp {
                                             self.livedata.organizeedit_value = value;
                                         }
                                         response.request_focus();
+                                        responses.push(response);
                                     }
                                     else {
                                         let response = ui.add(egui::Label::new(i.1).sense(egui::Sense::click()));
@@ -1709,6 +1760,7 @@ impl eframe::App for SuperPatchApp {
                                             self.livedata.organizeedit_value = i.1.to_string();
                                             
                                         }
+                                        responses.push(response);
                                     }
                                 });
                             }
@@ -1757,7 +1809,8 @@ impl eframe::App for SuperPatchApp {
                                     }
                                 }
                             }
-                            response.context_menu(|ui| {
+                            let combined =  responses.into_iter().fold(response, |acc, r| acc | r);
+                            combined.context_menu(|ui| {
                                 if ui.button(if enabled { "Disable" } else { "Enable" }).clicked() {
                                     self.orderdata[priority as usize]["enabled"] = Value::Bool(!enabled);
                                     self.update_all();
@@ -1784,9 +1837,18 @@ impl eframe::App for SuperPatchApp {
                                     self.livedata.organizeedit_index = priority as usize;
                                     self.livedata.organizeedit_value = version.to_string();
                                 }
-
-                                if ui.button("Open Website").clicked() {
-                                    //TODO General: Add open website. Disable if field is empty.
+                                let website_exists = matches!(self.orderdata.get(priority as usize).unwrap_or(&Value::Null).get("website").unwrap_or(&Value::Null), Value::String(string) if !string.is_empty());
+                                if ui.add_enabled(website_exists, egui::Button::new("Open Website")).clicked() {
+                                    let mod_website = self.orderdata.get(priority as usize).unwrap_or(&Value::Null).get("website").unwrap_or(&Value::Null);
+                                    match mod_website {
+                                        Value::String(string) => { 
+                                            if let Err(e) = open::that(string) {
+                                                *self.status.lock().unwrap() = format!("Failed to open mod folder: {}", e);
+                                            }
+                                        }
+                                        _ => {*self.status.lock().unwrap() = "Mod path is empty/invalid.".to_string();}
+                                    }
+                                    ui.close();
                                 }
                                 if ui.button("Delete mod").clicked() {
                                     //TODO General: Warn user about deletion.
@@ -1812,7 +1874,7 @@ impl eframe::App for SuperPatchApp {
                                     && !string.is_empty() {
                                         let archive_path = Path::new(string);
                                         if fs::exists(archive_path).unwrap() {
-                                            self.livedata.install_modal_open = true;
+                                            self.livedata.modal_open = ModalType::Install;
                                             self.livedata.install_modal_path = archive_path.to_path_buf();
                                             self.livedata.install_modal_requested_install_index = priority as usize;
                                             self.livedata.install_modal_requested_install_index_target = SpecificIndexTarget::Replace;
@@ -1864,6 +1926,7 @@ impl eframe::App for SuperPatchApp {
                     if egui::DragAndDrop::has_any_payload(ui.ctx()) {
                         //TODO General: Scroll when touching edges of screen & dragging.
                     }
+                    //TODO Mods: Drag and Drop files to install mods
                 }
                 //MARK: Files Page
                 Tab::Files => {
@@ -1872,7 +1935,7 @@ impl eframe::App for SuperPatchApp {
                         self.vfssort_list_refresh_requested = false;
                     }
                     let original_widths = self.settings["files_widths"].as_array().cloned().unwrap_or_else(|| vec![Value::from(200.0), Value::from(100.0), Value::from(100.0)]);
-                    //TODO General: Fix table sizing issues (See above.)
+                    //FIXME General: Fix table sizing issues (See above.)
                     TableBuilder::new(ui)
                     .sense(egui::Sense::click())
                     .striped(true)
@@ -2006,7 +2069,7 @@ fn main() {
     );
 }
 
-//MARK: Data Handling
+//MARK: Basic Data Handling
 fn read_order_data() -> Value {
     let orderdata_path = Path::new("configs/order.json");
     if !Path::exists(orderdata_path) {
@@ -2558,7 +2621,7 @@ fn archive_extract(archive_path: PathBuf, target_path: PathBuf, root_list: Vec<(
     }
 }
 
-//MARK: FOMOD FileList parsing
+//MARK: FOMOD Handling
 //SLOP
 fn parse_file_list(
     doc: &Document,
@@ -2613,7 +2676,6 @@ pub fn parse_file_list_flat(doc: &Document, file_list_node: NodeId, root: String
     }).collect()
 }
 
-//MARK: FOMOD Dependency Parsing
 //SLOP
 fn parse_composite_deps(doc: &Document, composite_node: NodeId) -> CompositeDependency {
     let aff_op = if evaluate(doc, composite_node, "@operator").unwrap().to_string() == "Or" { AffectOperator::Or } else { AffectOperator::And };
@@ -2651,8 +2713,6 @@ fn parse_flags(doc: &Document, flags_list: &Vec<NodeId>) -> Vec<(String, String)
     }
     flags
 }
-
-//MARK: Flag Calculation
 
 fn calculate_flags(data: &mut WizardInstallData, advance: bool) {
     //-2: Uncalculated Value
@@ -2715,7 +2775,6 @@ fn calculate_flags(data: &mut WizardInstallData, advance: bool) {
             }
         }
     }
-    //CHECK Mods: Untested
     for conditionalinstall in &mut data.conditional_roots {
         conditionalinstall.active = flag_check(conditionalinstall.aff_com.clone(), total_flags.clone());
     }
@@ -2724,7 +2783,6 @@ fn calculate_flags(data: &mut WizardInstallData, advance: bool) {
     data.track[len-1] = next_page_index;
 }
 
-//MARK: Flag Check
 //SLOP
 fn flag_check(check: CompositeDependency, reference: HashMap<String, String>) -> bool {
     match check.aff_op {
@@ -2895,6 +2953,33 @@ fn get_7z_binary_path() -> std::io::Result<PathBuf> {
             fs::set_permissions(&bin_path, perms)?;
         }
     }
-
     Ok(bin_path)
+}
+
+fn parse_command(input: &str) -> Result<(HashMap<String,String>, String, Vec<String>), String> {
+    let tokens = shell_words::split(input).unwrap();
+    let mut env: HashMap<String, String> = HashMap::new();
+    let mut cmd = None;
+    let mut args = Vec::new();
+    for token in tokens {
+        if cmd.is_none() {
+            if token.contains('=') && !token.starts_with('=') {
+                let mut parts  = token.splitn(2, "=");
+                let key = parts.next().unwrap();
+                let val = parts.next().unwrap_or("");
+                env.insert(key.to_string(), val.to_string());
+            } 
+                else {
+                cmd = Some(token)
+            }
+        } 
+        else {
+            args.push(token);
+        }
+    }
+    match cmd { 
+        Some(_) => {Ok((env, cmd.unwrap(), args))}
+        _ => {Err("Command not found".to_string())}
+    }
+
 }
