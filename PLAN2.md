@@ -11,8 +11,8 @@ Each source can be linked to a diff-formatted file that will be used, by hash of
 Supported diff formats:
 |Format|Support|Type|
 |------|-------|----|
-|.ltx|YES|TBD|
-|.xml|YES|TBD|
+|.ltx|YES|DLTX|
+|.xml|YES|DXML|
 
 Of course, few file types can be safely diffed. 
 
@@ -22,11 +22,15 @@ Depending on the type of file, different methods must be used.
 
 ### Diff Merge & Patch
 
-For file types that use diff-formats, sources are merged together to create the final file used in the VFS. Sources can be selected / deselected at will and reordered for priority. In this format, INTERNAL conflicts can arise when two diff-files files override the same part. The user can create ONE _modpack_ diff-file to resolve this, which is always highest priority, and is very special in that it does not have a direct source, but is instead linked to the conflicting sections themselves. (NOT the diff-files, the sections.)  
+For file types that use diff-formats, sources are merged together to create the final file used in the VFS. Sources can be selected / deselected at will and reordered for priority. In this format, INTERNAL conflicts can arise when two diff-files files override the same part. The user can create ONE _modpack_ diff-file to resolve this, which is always highest priority, and is very special in that it does not have a direct source, but is instead linked to the conflicting sections themselves. (NOT the diff-files, the sections.)
+
+Errors: out-of-date diff-file, out-of-date modpack diff-file, missing diff-file link, no diff-file for source
 
 ### Manual Merge
 
-For file types that do not support diff-formats, a user must manually select a file or provide a custom merged one TODO linked?. This option is also available for diff-formats but strongly discouraged.
+For file types that do not support diff-formats, a user must manually select a file or provide a custom merged one. This merged file can be linked to sources, providing easy editing comparisons and out-of-date markers. This option is also available for diff-formats but strongly discouraged.
+
+Errors: out-of-date override link, missing selection
 
 ## Editor / Updating
 
@@ -56,11 +60,12 @@ Certain formats (most notably .script) do have rhyme and reason to their working
 
 The JSON is per-final-file.
 
-In diff-format supporting formats, it contains 
+In diff-file supporting formats, it contains:
 - A diff-file list, each entry containing:
-    - Path to diff-file
-    - Path to source file backup
-    - Source file hash
+    - If not direct:
+        - Path to diff-file
+        - Path to source file backup
+        - Source file hash
     - Source file mod name
     - Source file mod path (both so if one changes, it will update to never lose track)
     - Reference ID (unchanging)
@@ -69,8 +74,31 @@ In diff-format supporting formats, it contains
     - Path to diff-file
     - List of linked diff-file hashes and reference IDs
     - List of linked section backups and host reference IDs
+
 In all formats, it contains:
 
-- Path to override file OR selection 
+- Selection:
+    - Source file hash
+    - Source file mod name
+    - Source file mod path
+OR
+- Override:
+    - Override file path
+    - List of linked source files, each entry containing:
+        - Source file hash
+        - Source file mod name
+        - Source file mod path
 
-Everything is optional, as all nessacary non-patch data is pulled directly from the VFS and mod data, so a empty patch is actually empty.
+Everything is optional, as all nessacary non-patch data is pulled directly from the VFS and mod data, so an empty patch is actually empty.
+
+## External Data needed
+
+In all formats, it contains:
+- A list of all sources, each entry containing:
+    - Path to source file
+    - Source file hash
+    - Source file mod name
+    - Source file mod path
+
+## UI Image
+![ui image](assets/image.png)

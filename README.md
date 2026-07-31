@@ -18,13 +18,19 @@ You'll probably need these. Download and add them.
 
 Import an existing modpack from MO2.
 
+#### Install Game
+
+#### Export Modpack
+
+#### Import Modpack
+
 ## Patching
 
 I haven't done this yet.
 
-Wondering why it's called Super"patch"? (terrible name btw.) It's because of this! I was originally just going to make a plugin for MO2. But it didn't seem feasible. So I made my own mod manager! In my opinion, S.T.A.L.K.E.R. modding suffers from constant CONFLICTS and PATCHES. It's really terrible. DLTX patches can be helpful, but they really seem like a bandaid on a dam. Many mods try to deal with conflicts by patching over files and implementing their new behavior AND the mod that they PRESUME you have's intended behavior. What if you have THREE mods that modify the same file? Well, you better hope one of them implements the behavior of all three in a patch. This can get much more out of hand. So! that is where this comes in hand. 
+Wondering why it's called Super"patch"? (terrible name btw.) It's because of this! I was originally just going to make a plugin for MO2. But it didn't seem feasible. So I made my own mod manager! In my opinion, S.T.A.L.K.E.R. modding suffers from constant CONFLICTS and PATCHES. It's really terrible. DLTX and DXML patches are helpful, but few mods actually use them. Many mods try to deal with conflicts by patching over files and implementing their new behavior AND the mod that they PRESUME you have's intended behavior. What if you have THREE mods that modify the same file? Well, you better hope one of them implements the behavior of all three in a patch. This can get much more out of hand. So! that is where this comes in hand. 
 
-You (will in the future soon be able to and do by doing this) can select a file with conflicts in the File menu and open it in the Patch menu. Now, you can see a list of all the various sources for the files from many mods. You can also see DLTX patches! And then you can like... see the hashes of the files and then like make a master patch or something that... it's still in progress. See PLAN.md if you really care about my ideas. TBD.
+You (will in the future soon be able to and do by doing this) can convert supported files into their differential form, and make a master patch to adjust any internal conflicts. In files that do not support this, you can manually select the file that is used (e.g. textures), or merge multiple together using a code editor (e.g scripts).
 
 ## Transferability
 
@@ -39,7 +45,6 @@ Here's a folder structure for your reference.
 - mods/ - This folder holds all the files for your mods. You'll definitely need this. Don't seperate this from config.
 - patch/ - This folder holds all the files for your patch. If you have a patch, you'll need this. Don't seperate this from config.
 - archives/ - This folder holds all the original archives for your mods. You don't nesscarily need this, but it's useful for reinstalling things.  
-- instance/ - While nothing requires you to, I reccommend you install your game in here. You have to make this folder. It's your responsibility.
 - .saved/ - This is YOUR save data. I would reccomend keeping it. But you probably don't need to share it with others.
 - .vfs/ - This is the instance's temporary folder where the game actually runs. You don't need to share this. You can also probably delete this at will, as it's generated on launch! With exception. This MAY contain your save data if new files appear and the changes have not been saved to .saved/. To avoid this, make sure to Save VFS Changes in the File menu before deleting it. Also, don't delete it while the game is running. Duh.
 
@@ -47,7 +52,26 @@ Now, that's a little complicated. I should probably make another project for sha
 
 ## Install
 
-You probably want an install! Uhh.. Give me some time. It's not done. cargo build prolly?
+### Download Superpatch
+
+Download or build the executable that matches your system.
+
+#### Github Releases
+
+TBD
+
+#### Build from source
+
+git clone it and then run `cargo build --release`
+
+### Install Superpatch
+
+1. Make a folder in a directory of your choosing for your modpack. For this example, I'll use `~/Documents/Games/mymodpack/`.
+2. Move the superpatch executable of your choice into the folder.
+3. Launch the executable. Follow the setup. If you already have a game instance, you can link it, if you don't, install the intance somewhere else, say `~/Documents/Games/Anomaly/`. The setup will also configure wine on linux.
+5. You're done! Install mods and launch the game as you will.
+
+The guided setup is not done. Sorry.
 
 ## A note on this project
 
