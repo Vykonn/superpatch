@@ -1,5 +1,5 @@
 use chrono::Local;
-use eframe::egui::{self, Id, Modal, RichText, Vec2};
+use eframe::egui::{self, DroppedFile, HoveredFile, Id, Modal, RichText, Vec2};
 use egui_extras::{Column, TableBuilder};
 use native_dialog::DialogBuilder;
 use ordered_hash_map::OrderedHashMap;
@@ -10,6 +10,7 @@ use serde_json::{Value, json};
 use unarc_rs::unified::ArchiveFormat;
 use xmloxide::{Document, NodeId};
 use xmloxide::xpath::evaluate;
+use std::ffi::OsStr;
 use std::fs::{File, create_dir_all, remove_dir_all};
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
@@ -64,6 +65,9 @@ enum OrganizeSortEditType {
     Name,
     Category,
     Version,
+    //Properties only
+    Website,
+    Path,
 }
 #[derive(Clone)]
 struct OrganizeSortListEntry {
@@ -126,6 +130,7 @@ struct LiveData {
     organizeedit_type: OrganizeSortEditType,
     organizeedit_index: usize,
     organizeedit_value: String,
+    relevant_index: usize,
 }
 #[derive(Clone, PartialEq)]
 enum ModalType {
@@ -137,7 +142,9 @@ enum ModalType {
     Modded,
     Proton,
     Game,
-    Setup
+    Setup,
+    Properties,
+    DeleteWarning
 }
 type ArchiveVFSTree = BTreeMap<String, ArchiveVFSNode>;
 #[derive(Clone)]
@@ -370,6 +377,7 @@ impl SuperPatchApp {
                 organizeedit_type: OrganizeSortEditType::None,
                 organizeedit_index: 0,
                 organizeedit_value: String::new(),
+                relevant_index: 0,
             },
         }
     }
@@ -422,6 +430,7 @@ impl SuperPatchApp {
                         return;
                     }
                     else {
+                        //NOT Manual, autodetect skip, just marked as manual so can go back to manual if desired
                         self.livedata.install_modal_type = InstallModalType::Manual;
                         let (name, version) = parse_archive_name(self.livedata.install_modal_path.file_stem().unwrap().to_str().unwrap());
                         let copy_archive = self.settings["copy_archive"].as_bool().unwrap_or(true);
@@ -454,6 +463,7 @@ impl SuperPatchApp {
                 return;
             }
             else {
+                //NOT Manual, autodetect skip, just marked as manual so can go back to manual if desired
                 self.livedata.install_modal_type = InstallModalType::Manual;
                 let (name, version) = parse_archive_name(self.livedata.install_modal_path.file_stem().unwrap().to_str().unwrap());
                 let copy_archive = self.settings["copy_archive"].as_bool().unwrap_or(true);
@@ -1001,6 +1011,112 @@ impl eframe::App for SuperPatchApp {
                 self.livedata.modal_open = ModalType::None;
             }
         }
+        
+        if self.livedata.modal_open == ModalType::Properties {
+            let modded_exes_modal = Modal::new(Id::new("properties_modal")).show(ui.ctx(), |ui| {
+                ui.heading("Properties");
+                ui.label("Careful! This can break things!");
+                let selected_data = self.orderdata.get_mut(self.livedata.relevant_index).unwrap();
+                let name = if let Value::String(string) = selected_data.get("name").unwrap_or(&Value::Null).clone() {string} else {String::new()};
+                let version = if let Value::String(string) = selected_data.get("version").unwrap_or(&Value::Null).clone() {string} else {String::new()};
+                let website = if let Value::String(string) = selected_data.get("website").unwrap_or(&Value::Null).clone() {string} else {String::new()};
+                let path = if let Value::String(string) = selected_data.get("path").unwrap_or(&Value::Null).clone() {string} else {String::new()};
+                let category = if let Value::String(string) = selected_data.get("category").unwrap_or(&Value::Null).clone() {string} else {String::new()};
+                let enabled = if let Value::Bool(bool) = selected_data.get("enabled").unwrap_or(&Value::Null).clone() {bool} else {false};
+                let enabled_string = if enabled {"True"} else {"False"};
+                let mut update = false;
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label("Enabled:");
+                        ui.label("Name:");
+                        ui.label("Version:");
+                        ui.label("Path:");
+                        ui.label("Category:");
+                        ui.label("Website:");
+                    });
+                    ui.separator();
+                    ui.vertical(|ui| {
+                        ui.style_mut().interaction.selectable_labels = false;
+                        if ui.add(egui::Label::new(enabled_string).sense(egui::Sense::click())).clicked() {
+                            self.orderdata[self.livedata.relevant_index]["enabled"] = Value::Bool(!enabled);
+                            update = true;
+                        };
+                        ui.style_mut().interaction.selectable_labels = true;
+                        for i in [("name", name, OrganizeSortEditType::Name), ("category", category, OrganizeSortEditType::Category), ("version", version, OrganizeSortEditType::Version),("path", path, OrganizeSortEditType::Path),("website", website, OrganizeSortEditType::Website)] {
+                            if self.livedata.organizeedit_type == i.2 && self.livedata.organizeedit_index == 99999
+                            {
+                                let mut value = self.livedata.organizeedit_value.clone();
+                                let response = ui.add(egui::TextEdit::singleline(&mut value));
+                                if response.lost_focus() {
+                                    self.orderdata[self.livedata.relevant_index][i.0] = Value::String(value.clone());
+                                    self.update_all();
+                                    self.clear_organize_edit();
+                                }
+                                if response.changed() {
+                                    self.livedata.organizeedit_value = value;
+                                }
+                                response.request_focus();
+                            }
+                            else {
+                                let response = ui.add(egui::Label::new(&i.1).sense(egui::Sense::click()));
+                                if response.double_clicked() {
+                                    self.livedata.organizeedit_type = i.2;
+                                    self.livedata.organizeedit_index = 99999;
+                                    self.livedata.organizeedit_value = i.1.to_string();
+                                    
+                                }
+                            }
+                        }
+                    });
+                });
+                if update {
+                    self.update_order_sort();
+                }
+            });
+            if modded_exes_modal.should_close() {
+                self.livedata.modal_open = ModalType::None;
+            }
+        }
+
+        if self.livedata.modal_open == ModalType::DeleteWarning {
+            let modded_exes_modal = Modal::new(Id::new("game_modal")).show(ui.ctx(), |ui| {
+                ui.style_mut().interaction.selectable_labels = false;
+                ui.heading("Are you sure?");
+                ui.label("This will permanently delete this mod and its saved archive.");
+                ui.horizontal(|ui| {
+                    if ui.button("Delete").clicked() {
+                        let path = self.orderdata.get(self.livedata.relevant_index).unwrap().get("path").unwrap_or(&Value::Null);
+                        if let Value::String(string) = path && !string.is_empty() {
+                            let folder_path = Path::new(string);
+                            if fs::exists(folder_path).unwrap() {
+                                fs::remove_dir_all(string).expect("Failed to delete mod directory");
+                            }
+                        }
+                        let archive = self.orderdata.get(self.livedata.relevant_index).unwrap().get("archive").unwrap_or(&Value::Null);
+                        if let Value::String(string) = archive && !string.is_empty() {
+                            let archive_path = Path::new(string);
+                            //Don't delete it if it came from somewhere else.
+                            if string.starts_with("archive") {
+                                if fs::exists(archive_path).unwrap() {
+                                    fs::remove_file(archive_path).expect("Archive could not be deleted.");
+                                }
+                            }
+                        }
+                        self.orderdata.as_array_mut().unwrap().remove(self.livedata.relevant_index);
+                        *self.status.lock().unwrap() = "Deleted mod.".to_string();
+                        self.update_order_sort();
+                        ui.close();
+                    }
+                    if ui.button("Cancel").clicked() {
+                        ui.close();
+                    }
+                });
+            });
+            if modded_exes_modal.should_close() {
+                self.livedata.modal_open = ModalType::None;
+            }
+        }
+
         //MARK: Wine Modal
         //TODO Tools: Install / detect wine or proton and set up wineprefix for the game. (Linux only)
         //GET WINE
@@ -1019,6 +1135,7 @@ impl eframe::App for SuperPatchApp {
         {
             if self.livedata.modal_open == ModalType::Proton {
                 let wine_modal = Modal::new(Id::new("wine_modal")).show(ui.ctx(), |ui| {
+                    ui.style_mut().interaction.selectable_labels = false;
                     ui.heading("Wine Setup");
                     ui.label("This feature is not yet implemented.");
                 });
@@ -1031,6 +1148,7 @@ impl eframe::App for SuperPatchApp {
         //TODO Tools: Install latest modded EXEs.
         if self.livedata.modal_open == ModalType::Modded {
             let modded_exes_modal = Modal::new(Id::new("modded_exes_modal")).show(ui.ctx(), |ui| {
+                ui.style_mut().interaction.selectable_labels = false;
                 ui.heading("Install Modded EXEs");
                 ui.label("This feature is not yet implemented.");
             });
@@ -1042,6 +1160,7 @@ impl eframe::App for SuperPatchApp {
         //TODO Tools: Import modpack
         if self.livedata.modal_open == ModalType::Import {
             let import_modal = Modal::new(Id::new("import_modal")).show(ui.ctx(), |ui| {
+                ui.style_mut().interaction.selectable_labels = false;
                 ui.heading("Import Modpack");
                 ui.label("This feature is not yet implemented.");
             });
@@ -1053,6 +1172,7 @@ impl eframe::App for SuperPatchApp {
         //TODO Tools: Export modpack
         if self.livedata.modal_open == ModalType::Export {
             let import_modal = Modal::new(Id::new("export_modal")).show(ui.ctx(), |ui| {
+                ui.style_mut().interaction.selectable_labels = false;
                 ui.heading("Export Modpack");
                 ui.label("This feature is not yet implemented.");
             });
@@ -1068,6 +1188,7 @@ impl eframe::App for SuperPatchApp {
         //Start/Cancel
         if self.livedata.modal_open == ModalType::ImportMO2 {
             let import_modal = Modal::new(Id::new("import_mo2_modal")).show(ui.ctx(), |ui| {
+                ui.style_mut().interaction.selectable_labels = false;
                 ui.heading("Import from MO2");
                 ui.label("This feature is not yet implemented.");
             });
@@ -1630,7 +1751,7 @@ impl eframe::App for SuperPatchApp {
                 Tab::Organize => {
                     //FIXME General: Fix table sizing issues
                     //Underfill: Calculate new size upon window resizing relative to previous size.
-                    //Overflow: ???
+                    //Overflow: Shrink other columns to fit in area until too small, then stop
                     let mut request_update = false;
                     let original_widths = self.settings["organize_widths"].as_array().cloned().unwrap_or_else(|| vec![Value::from(50.0), Value::from(200.0), Value::from(100.0), Value::from(100.0), Value::from(100.0)]);
                     TableBuilder::new(ui)
@@ -1769,17 +1890,18 @@ impl eframe::App for SuperPatchApp {
                             });
                             //MARK: Response
                             let response = row.response();
+                            let combined =  responses.into_iter().fold(response, |acc, r| acc | r);
                             if self.organizesort == OrganizeSort::PriorityAsc || self.organizesort == OrganizeSort::PriorityDesc {
-                                response.dnd_set_drag_payload(priority);
+                                combined.dnd_set_drag_payload(priority);
                             } else {
-                                if response.drag_started() {
+                                if combined.drag_started() {
                                     *self.status.lock().unwrap() = "Drag and Drop is only available when sorting by Priority.".to_string();
                                 }
                             }
                             if let (Some(pointer), Some(_hovered_payload)) = (
-                                ui_clone.pointer_interact_pos(), row.response().dnd_hover_payload::<i64>(),
+                                ui_clone.pointer_interact_pos(), combined.dnd_hover_payload::<i64>(),
                             ) {
-                                let rect = response.rect;
+                                let rect = row.response().rect;
                                 let stroke = egui::Stroke::new(2.0, egui::Color32::WHITE);
                                 let mut insert_row_index = if pointer.y < rect.center().y {
                                     painter_clone.hline(rect.x_range(), rect.top(), stroke);
@@ -1788,8 +1910,7 @@ impl eframe::App for SuperPatchApp {
                                     painter_clone.hline(rect.x_range(), rect.bottom(), stroke);
                                     row_index + 1
                                 };
-
-                                if let Some(dragged_payload) = row.response().dnd_release_payload::<i64>() {
+                                if let Some(dragged_payload) = combined.dnd_release_payload::<i64>() {
                                     let dragged_index = *dragged_payload;
                                     if self.organizesort == OrganizeSort::PriorityDesc {
                                             insert_row_index = self.orderdata.as_array().cloned().unwrap_or_else(Vec::new).len() - insert_row_index;
@@ -1809,7 +1930,38 @@ impl eframe::App for SuperPatchApp {
                                     }
                                 }
                             }
-                            let combined =  responses.into_iter().fold(response, |acc, r| acc | r);
+                            let dropped = ui_clone.input(|i| i.raw.dropped_files.clone());
+                            if let Some(dragged_payload) = dropped.first() {
+                                if let Some(pointer) = ui_clone.input(|i| i.pointer.interact_pos()) {
+                                    let rect = row.response().rect;
+                                    if rect.contains(pointer) {
+                                        let mut insert_row_index = if pointer.y < rect.center().y {
+                                            row_index
+                                        } else {
+                                            row_index + 1
+                                        };
+                                        if self.organizesort == OrganizeSort::PriorityDesc {
+                                            insert_row_index = self.orderdata.as_array().cloned().unwrap_or_else(Vec::new).len() - insert_row_index;
+                                        }
+                                        if let Some(path) = &dragged_payload.path {
+                                            if unarc_rs::unified::supported_extensions()
+                                                .contains(&path.extension().unwrap_or(OsStr::new("")).to_str().unwrap())
+                                            {
+                                                if fs::exists(path).unwrap() {
+                                                    self.livedata.modal_open = ModalType::Install;
+                                                    self.livedata.install_modal_path = path.clone();
+                                                    self.livedata.install_modal_requested_install_index = insert_row_index;
+                                                    self.livedata.install_modal_requested_install_index_target = SpecificIndexTarget::Before;
+                                                } else {
+                                                    *self.status.lock().unwrap() = "Archive not found".to_string();
+                                                }
+                                            } else {
+                                                *self.status.lock().unwrap() = "Invalid Archive type.".to_string();
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             combined.context_menu(|ui| {
                                 if ui.button(if enabled { "Disable" } else { "Enable" }).clicked() {
                                     self.orderdata[priority as usize]["enabled"] = Value::Bool(!enabled);
@@ -1817,11 +1969,7 @@ impl eframe::App for SuperPatchApp {
                                     *self.status.lock().unwrap() = if enabled { "Disabled mod.".to_string() } else { "Enabled mod.".to_string() };
                                     ui.close();
                                 }
-                                if ui.button("Copy name").clicked() {
-                                    ui.ctx().copy_text(name.to_owned());
-                                    *self.status.lock().unwrap() = "Copied mod name to clipboard.".to_string();
-                                    ui.close();
-                                }
+                                ui.separator();
                                 if ui.button("Rename mod").clicked() {
                                     self.livedata.organizeedit_type = OrganizeSortEditType::Name;
                                     self.livedata.organizeedit_index = priority as usize;
@@ -1837,6 +1985,22 @@ impl eframe::App for SuperPatchApp {
                                     self.livedata.organizeedit_index = priority as usize;
                                     self.livedata.organizeedit_value = version.to_string();
                                 }
+                                if ui.button("Properties").clicked() {
+                                    self.livedata.modal_open = ModalType::Properties;
+                                    self.livedata.relevant_index = priority as usize;
+                                }
+                                ui.separator();
+                                if ui.button("Open mod folder").clicked() {
+                                    let mod_path = mod_entry.path.as_str();
+                                    if !mod_path.is_empty() {
+                                        if let Err(e) = open::that(mod_path) {
+                                            *self.status.lock().unwrap() = format!("Failed to open mod folder: {}", e);
+                                        }
+                                    } else {
+                                        *self.status.lock().unwrap() = "Mod path is empty.".to_string();
+                                    }
+                                    ui.close();
+                                }
                                 let website_exists = matches!(self.orderdata.get(priority as usize).unwrap_or(&Value::Null).get("website").unwrap_or(&Value::Null), Value::String(string) if !string.is_empty());
                                 if ui.add_enabled(website_exists, egui::Button::new("Open Website")).clicked() {
                                     let mod_website = self.orderdata.get(priority as usize).unwrap_or(&Value::Null).get("website").unwrap_or(&Value::Null);
@@ -1850,23 +2014,11 @@ impl eframe::App for SuperPatchApp {
                                     }
                                     ui.close();
                                 }
+                                ui.separator();
                                 if ui.button("Delete mod").clicked() {
-                                    //TODO General: Warn user about deletion.
-                                    if mod_entry.path.as_str() != "" {
-                                        fs::remove_dir_all(mod_entry.path.as_str()).expect("Failed to delete mod directory");
-                                    }
-                                    let archive = self.orderdata.get(priority as usize).unwrap().get("archive").unwrap_or(&Value::Null);
-                                    if let Value::String(string) = archive
-                                    && !string.is_empty() {
-                                        let archive_path = Path::new(string);
-                                        if fs::exists(archive_path).unwrap() {
-                                            fs::remove_file(archive_path).expect("Archive could not be deleted.");
-                                        }
-                                    }
-                                    self.orderdata.as_array_mut().unwrap().remove(priority as usize);
-                                    *self.status.lock().unwrap() = "Deleted mod.".to_string();
-                                    request_update = true;
-                                }
+                                    self.livedata.modal_open = ModalType::DeleteWarning;
+                                    self.livedata.relevant_index = priority as usize;
+                                }    
                                 let archive_exists = matches!(self.orderdata.get(priority as usize).unwrap_or(&Value::Null).get("archive").unwrap_or(&Value::Null), Value::String(string) if !string.is_empty());
                                 if ui.add_enabled(archive_exists, egui::Button::new("Reinstall mod")).clicked() {  
                                     let archive = self.orderdata.get(priority as usize).unwrap().get("archive").unwrap_or(&Value::Null);
@@ -1887,22 +2039,13 @@ impl eframe::App for SuperPatchApp {
                                     
                                 }
                                 if ui.button("Update mod").clicked() {
-                                    //TODO Mods: Update mod (New install sequence with new file prompt, keep path.)
-                                    //Specific index here, Replace
-                                }
-                                if ui.button("Open mod folder").clicked() {
-                                    let mod_path = mod_entry.path.as_str();
-                                    if !mod_path.is_empty() {
-                                        if let Err(e) = open::that(mod_path) {
-                                            *self.status.lock().unwrap() = format!("Failed to open mod folder: {}", e);
-                                        }
-                                    } else {
-                                        *self.status.lock().unwrap() = "Mod path is empty.".to_string();
+                                    let path = pick_mod_file();
+                                    if let Some(path_full) = path {
+                                        self.livedata.modal_open = ModalType::Install;
+                                        self.livedata.install_modal_path = path_full;
+                                        self.livedata.install_modal_requested_install_index = priority as usize;
+                                        self.livedata.install_modal_requested_install_index_target = SpecificIndexTarget::Replace;
                                     }
-                                    ui.close();
-                                }
-                                if ui.button("Properties").clicked() {
-                                    //TODO Mods: Properties Modal.
                                 }
                             });
                         });
@@ -1926,7 +2069,6 @@ impl eframe::App for SuperPatchApp {
                     if egui::DragAndDrop::has_any_payload(ui.ctx()) {
                         //TODO General: Scroll when touching edges of screen & dragging.
                     }
-                    //TODO Mods: Drag and Drop files to install mods
                 }
                 //MARK: Files Page
                 Tab::Files => {
@@ -2047,7 +2189,8 @@ fn main() {
                 viewport_size[0].as_f64().unwrap_or(800.0) as f32,
                 viewport_size[1].as_f64().unwrap_or(600.0) as f32,
             ))
-            .with_maximized(settings["window_maximized"].as_bool().unwrap_or(false)),
+            .with_maximized(settings["window_maximized"].as_bool().unwrap_or(false))
+            .with_drag_and_drop(true),
         ..Default::default()
     };
     let _ = eframe::run_native(
