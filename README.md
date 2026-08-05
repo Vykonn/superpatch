@@ -2,28 +2,6 @@
 
 \#hype mod manager designed for [S.T.A.L.K.E.R Anomaly](https://www.moddb.com/mods/stalker-anomaly). Made in \#rust (\#blazinglyfast.) Much faster than Mod Organizer 2. (except for extracting solid 7z files.) It's also cross-platform. And it has some other features that I think are useful.
 
-## Tools
-
-Complete speculation. I haven't made them yet. I will! I promise!
-
-#### Wine & Proton
-
-If you use linux, detects already existing proton or wine. If it can't be found, helps you install it. Then makes a command to use it.
-
-#### Modded EXEs
-
-You'll probably need these. Download and add them.
-
-#### MO2 Import
-
-Import an existing modpack from MO2.
-
-#### Install Game
-
-#### Export Modpack
-
-#### Import Modpack
-
 ## Patching
 
 I haven't done this yet.
@@ -64,14 +42,27 @@ TBD
 
 git clone it and then run `cargo build --release`
 
+### Before Installation
+
+If you do not already have the game, extract [S.T.A.L.K.E.R Anomaly](https://www.moddb.com/mods/stalker-anomaly) to a directory of your choice. In this example we'll use `~/Documents/Games/Anomaly/`
+
+On Windows, you should enable Symlinks. Follow these instructions: [Symlinks](https://neacsu.net/posts/win_symlinks). If you don't, the process will need to be in root.
+
+Some modpacks may need Modded EXEs. Install them manually from https://github.com/themrdemonized/xray-monolith. This has not been made a tool because the version you use depends quite a lot.
+
 ### Install Superpatch
 
 1. Make a folder in a directory of your choosing for your modpack. For this example, I'll use `~/Documents/Games/mymodpack/`.
 2. Move the superpatch executable of your choice into the folder.
-3. Launch the executable. Follow the setup. If you already have a game instance, you can link it, if you don't, install the intance somewhere else, say `~/Documents/Games/Anomaly/`. The setup will also configure wine on linux.
-5. You're done! Install mods and launch the game as you will.
+3. Launch the executable. 
 
-The guided setup is not done. Sorry.
+### Setup
+
+1. Select your game installation folder.
+2. Select a command to run the game. I recommend `%path%/bin/AnomalyDX11.exe`. 
+- a. On Linux, you will need to use the Wine setup tool. It will create a command roughly in the form of `WINEPREFIX=[wine prefix] [wine path] %path%/bin/AnomalyDX11.exe`.
+- b. This is the command that will run the game, feel free to customize it at will. (e.g. gamescope, mangohud.) `%path%` will be replaced with the path to the VFS folder.
+3. If you are installing a modpack, use Tools > Import Modpack or Tools > Import from MO2 to migrate from an existing MO2 instance. Otherwise, you're done.
 
 ## A note on this project
 
@@ -82,3 +73,5 @@ Neither am I the greatest at issue management. All of the current issues that I 
 I have definitely used some AI for this. I haven't coded in a fair while, so I went through the cycle of the latest tech. Copilot, Kilo, Claude, blah blah blah. I didn't end up using these much. These uses are not labeled, but I think pretty minimal. I have finally settled it down to an art. I mostly write the code myself. If there is something that doesn't work, I may paste it into a seperate chatbot, and poke it for a fix. This is unnanotated. If there is a function that is just busywork, I ask a seperate chatbot to write it. If it looks good and works, I add it. This is annotated, however, with "SLOP". \#ethical \#ethicalslop \#homemade
 
 I don't intend to update this software much after it gets into a reliable state. Tools could be an exception. This is just another one of my projects throughout my journey across the web. I haven't even played that much S.T.A.L.K.E.R. Maybe... two hours? I don't know. I just was like, "this is unacceptable" and decided to make my own mod manager. So this could be complete garbage. But I'm pretty sure it's not. At least hopefully the mod management part can be useful to someone.
+
+Despite me calling it a "VFS" constantly, this software uses symlinks instead. It's much more convenient to just call it a VFS though... I may migrate to hard links or an actual VFS later.

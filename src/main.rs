@@ -1,3 +1,6 @@
+// Superpatch by Vykonn
+// PLAN Rework: Multiple instances support
+// PLAN Rework: Game Agnosticism
 use chrono::Local;
 use eframe::egui::{self, DroppedFile, HoveredFile, Id, Modal, RichText, Vec2};
 use egui_extras::{Column, TableBuilder};
@@ -86,9 +89,16 @@ struct VFSSortListEntry {
     name: String,
     down: i64,
     conflicts: i64,
-    conflicts_active: i64,
     dltx_patches: i64,
-    dltx_patches_active: i64,
+    internal_conflicts: i64,
+    patchstatus: PatchStatus
+}
+#[derive(Clone)]
+enum PatchStatus {
+    None,
+    Good,
+    OOD,
+    Error
 }
 #[derive(Clone)]
 struct VFSSort {
@@ -131,18 +141,27 @@ struct LiveData {
     organizeedit_index: usize,
     organizeedit_value: String,
     relevant_index: usize,
+    wine_modal_data: Option<WineModalData>,
+}
+#[derive(Clone, PartialEq)]
+struct WineModalData {
+    steam_found: bool,
+    proton_found: bool,
+    proton_paths: Vec<(String, String)>,
+    wine_found: bool,
+    wine_path: String,
+    selected_path: String,
+    target_command: String,
+    final_command: String,
+    selected_prefix: String,
 }
 #[derive(Clone, PartialEq)]
 enum ModalType {
     None,
     Install,
-    ImportMO2,
     Import,
     Export,
-    Modded,
     Proton,
-    Game,
-    Setup,
     Properties,
     DeleteWarning
 }
@@ -151,11 +170,6 @@ type ArchiveVFSTree = BTreeMap<String, ArchiveVFSNode>;
 enum ArchiveVFSNode {
     Dir(ArchiveVFSTree),
     File(String)
-}
-#[derive(Clone, PartialEq)]
-enum TextInputType {
-    None,
-    RenameFolder,
 }
 #[derive(Clone, PartialEq)]
 enum InstallModalType {
@@ -318,12 +332,6 @@ enum SpecificIndexTarget {
     Replace,
     Before
 }
-#[derive(Clone, PartialEq)]
-enum ExtensionType {
-    Zip,
-    Rar,
-    SevenZ
-}
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
 static SEVEN_ZIP_BYTES: &[u8] = include_bytes!("../binaries/7zz-x86_64-linux");
@@ -333,6 +341,9 @@ static SEVEN_ZIP_BYTES: &[u8] = include_bytes!("../binaries/7zz-x86_64-windows.e
 
 #[cfg(all(target_os = "macos"))]
 static SEVEN_ZIP_BYTES: &[u8] = include_bytes!("../binaries/7zz-macos");
+
+#[cfg(unix)]
+static WINETRICKS_BYTES: &[u8] = include_bytes!("../binaries/winetricks");
 
 impl SuperPatchApp {
     fn new(
@@ -378,6 +389,7 @@ impl SuperPatchApp {
                 organizeedit_index: 0,
                 organizeedit_value: String::new(),
                 relevant_index: 0,
+                wine_modal_data: None,
             },
         }
     }
@@ -450,7 +462,7 @@ impl SuperPatchApp {
                     }
                     break;
                 }
-                if !matches < 2 {
+                if matches >= 2 {
                     self.livedata.install_modal_type = InstallModalType::Select;
                     self.livedata.install_modal_root = [mainfolder.0.to_string(), "/".to_string()].concat();
                     return;
@@ -484,7 +496,7 @@ impl SuperPatchApp {
             }
             break;
         }
-        if matches > 1 {
+        if matches >= 2 {
             self.livedata.install_modal_type = InstallModalType::Select;
             return;
         }
@@ -762,25 +774,24 @@ impl SuperPatchApp {
             }
             None => panic!("No Pages!")
         }
-        let mut name = String::new();
-        let mut website = String::new();
-        let mut version = String::new();
         let info_exists = fomod_vfs.contains_key("info.xml");
-        if info_exists {
+        let (name, version, website) = if info_exists {
             image_roots.push(([install_root, "fomod/info.xml".to_string()].concat(), String::new()));
             archive_extract(self.livedata.install_modal_path.clone(), temp_dir.clone(), image_roots, Vec::new());
             //Get name, version & website from info.xml
             let info_xml = Document::parse_file(temp_dir.join("info.xml")).unwrap();
             let root = info_xml.root_element().unwrap();
-            name = evaluate(&info_xml, root, "string(Name)").unwrap().to_string();
-            website = evaluate(&info_xml, root, "string(Website)").unwrap().to_string();
-            version = evaluate(&info_xml, root, "string(Version)").unwrap().to_string();
+            let name = evaluate(&info_xml, root, "string(Name)").unwrap().to_string();
+            let website = evaluate(&info_xml, root, "string(Website)").unwrap().to_string();
+            let version = evaluate(&info_xml, root, "string(Version)").unwrap().to_string();
+            (name, version, website)
         }
         else {
             archive_extract(self.livedata.install_modal_path.clone(), temp_dir.clone(), image_roots, Vec::new());
             let module_name = evaluate(&mod_xml, root, "string(moduleName)").unwrap().to_string();
-            (name, version) = parse_archive_name(&module_name);
-        }
+            let (name, version) = parse_archive_name(&module_name);
+            (name, version, String::new())
+        };
         let mut data =  WizardInstallData {init_roots, pages, name, version, website, image, track: vec![0,-2], display: (0,0), conditional_roots};
         calculate_flags(&mut data, false);
         calculate_flags(&mut data, false);
@@ -876,6 +887,54 @@ impl SuperPatchApp {
         self.update_all();
         *self.status.lock().unwrap() = "Mod installed.".to_string();
     }
+    fn gen_wine_modal_data(&mut self, gen_all: bool) {
+        let mut wine_modal_data = match &self.livedata.wine_modal_data {
+            Some(wine_modal_data) => {&mut wine_modal_data.clone()}
+            None => {&mut WineModalData {steam_found: false, proton_found: false, proton_paths: Vec::new(), wine_found: false, wine_path: String::new(), selected_path: String::new(), target_command: String::from("%path%/bin/AnomalyDX11.exe"), final_command: String::from("Command incomplete"), selected_prefix: String::new()}}
+        };
+        if gen_all {
+            wine_modal_data.steam_found = false;
+            wine_modal_data.proton_found = false;
+            wine_modal_data.proton_paths = Vec::new();
+            let steam_test = steamlocate::locate();
+            match steam_test {
+                Ok(steam_dir) => {
+                    wine_modal_data.steam_found = true;
+                    for library in steam_dir.libraries().unwrap() {
+                        let library = match library {
+                            Ok(library) => library,
+                            Err(_) => {continue;}
+                        };
+                        for app in library.apps() {
+                            let app = match app {
+                                Ok(app) => app,
+                                Err(_) => {continue;}
+                            };
+                            if app.name.clone().unwrap().contains("Proton") {
+                                wine_modal_data.proton_found = true;
+                                wine_modal_data.proton_paths.push((app.name.clone().unwrap(), library.resolve_app_dir(&app).join("files/bin/wine").to_string_lossy().to_string()))
+                            }
+                        }
+                    }   
+                }
+                Err(_) => {}
+            }
+            let wine_test = which::which("wine");
+            match wine_test {
+                Ok(wine_dir) => {
+                    wine_modal_data.wine_found = true;
+                    wine_modal_data.wine_path = wine_dir.to_string_lossy().to_string();
+                }
+                Err(_) => {}
+            }
+        }
+        wine_modal_data.final_command = if !wine_modal_data.selected_path.is_empty() && !wine_modal_data.selected_prefix.is_empty() && !wine_modal_data.target_command.is_empty() {
+            format!("WINEPREFIX={} '{}' {}", wine_modal_data.selected_prefix, wine_modal_data.selected_path, wine_modal_data.target_command)
+        } else {
+            String::from("Command incomplete")
+        };
+        self.livedata.wine_modal_data = Some(wine_modal_data.clone());
+    }
     //MARK: Threaded Actions
     fn launch(&mut self) {
         //Save settings if they were changed in the UI
@@ -929,6 +988,7 @@ impl SuperPatchApp {
         *status.lock().unwrap() = "Moving files.".to_string();
         save_vfs_changes(Path::new(""));
         let real_vfs_path = realize_vfs_data(vfsdata_active, patchdata.clone());
+        //TODO Patch: Realize patchdata
         let game_command = settings["game_command"]
             .as_str()
             .unwrap_or("")
@@ -984,34 +1044,7 @@ impl eframe::App for SuperPatchApp {
                 save_settings(self.settings.clone());
             }
         }
-        //MARK: Setup Modal
-        //TODO Tools: Initial setup modal for first time users. (for real)
-        //If you on windows, https://neacsu.net/posts/win_symlinks/
-        if !self.settings["initialized"].as_bool().unwrap_or(false) {
-            self.settings["initialized"] = Value::Bool(true);
-            self.livedata.modal_open = ModalType::Setup;
-        }
-        if self.livedata.modal_open == ModalType::Setup {
-            let initial_modal = Modal::new(Id::new("initial_modal")).show(ui.ctx(), |ui| {
-                ui.heading("Initial Setup");
-                ui.label("hi if you are on windows you need to make sure symlinks are enabled: https://neacsu.net/posts/win_symlinks/. \n before you can install mods, you need a path and command to run the game. if you don't already have the game, go to tools > install game. if you do, edit the game path and command section to match that. if you're on linux, use the proton setup to get a proton command.");
-            });
-            if initial_modal.should_close() {
-                save_settings(self.settings.clone());
-            }
-        }
-        //MARK: Game Modal
-        //TODO Tools: Install game modal
-        if self.livedata.modal_open == ModalType::Game {
-            let modded_exes_modal = Modal::new(Id::new("game_modal")).show(ui.ctx(), |ui| {
-                ui.heading("Install Game");
-                ui.label("This feature is not yet implemented.");
-            });
-            if modded_exes_modal.should_close() {
-                self.livedata.modal_open = ModalType::None;
-            }
-        }
-        
+
         if self.livedata.modal_open == ModalType::Properties {
             let modded_exes_modal = Modal::new(Id::new("properties_modal")).show(ui.ctx(), |ui| {
                 ui.heading("Properties");
@@ -1117,47 +1150,131 @@ impl eframe::App for SuperPatchApp {
             }
         }
 
+        //MARK: Game Modal
+        //PLAN Launch: Game setup & Modded EXEs manager
+
         //MARK: Wine Modal
-        //TODO Tools: Install / detect wine or proton and set up wineprefix for the game. (Linux only)
-        //GET WINE
-        //Getting wine: Is steam installed?
-            //Yes: Is a version of proton above 10.0 installed?
-                //Yes: Use that.
-                //No: Install proton 10.0.
-            //No: Is wine installed?
-                //Yes: Use that.
-                //No: Install wine.
-        //Prefix setup:
-        //Create new prefix.
-        //Get winetricks
-        //Install cmd d3dcompiler_47 d3dx10 d3dx11_43 d3dx9 dx8vb quartz vcrun2022 dxvk
+        //PLAN Launch: Remake into cross-platform command selector.
         #[cfg(target_os = "linux")]
         {
             if self.livedata.modal_open == ModalType::Proton {
+                if self.livedata.wine_modal_data.is_none() {
+                    self.gen_wine_modal_data(true);
+                }
                 let wine_modal = Modal::new(Id::new("wine_modal")).show(ui.ctx(), |ui| {
                     ui.style_mut().interaction.selectable_labels = false;
+                    let wine_modal_data = self.livedata.wine_modal_data.clone().unwrap();
                     ui.heading("Wine Setup");
-                    ui.label("This feature is not yet implemented.");
+                    ui.separator();
+                    ui.label("Select a WINE:");
+                    if wine_modal_data.steam_found {
+                        if wine_modal_data.proton_found {
+                            ui.horizontal(|ui| {
+                                ui.label("Steam & Proton found.");
+                                ui.menu_button("Select", |ui| {
+                                    for proton_path in wine_modal_data.proton_paths {
+                                        if ui.button(proton_path.0).clicked() {
+                                            self.livedata.wine_modal_data.as_mut().unwrap().selected_path = proton_path.1;
+                                            self.gen_wine_modal_data(false);
+                                        }
+                                    }
+                                });
+                            });
+                        } else {
+                            ui.horizontal(|ui| {
+                                ui.label("Steam found but no Proton.");
+                                if ui.button("Install").clicked() {
+                                    open::that("steam://install/4628710").unwrap();
+                                }
+                            });
+                        }
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.label("Steam not found.");
+                            if ui.button("Install").clicked() {
+                                open::that("https://store.steampowered.com/about/").unwrap();
+                            }
+                        });
+                    }
+                    if wine_modal_data.wine_found {
+                        ui.horizontal(|ui| {
+                            ui.label("Local WINE found.");
+                            if ui.button("Use").clicked() {
+                                self.livedata.wine_modal_data.as_mut().unwrap().selected_path = wine_modal_data.wine_path;
+                                self.gen_wine_modal_data(false);
+                            }
+                        });
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.label("Wine not found.");
+                            if ui.button("Install").clicked() {
+                                open::that("https://www.winehq.org/").unwrap();
+                            }
+                        });
+                    }
+                    ui.label("Selected WINE:");
+                    if ui.text_edit_singleline(&mut self.livedata.wine_modal_data.as_mut().unwrap().selected_path).changed() {
+                        self.gen_wine_modal_data(false);
+                    };
+                    ui.separator();
+                    ui.label("Wineprefix setup");
+                    ui.horizontal(|ui| {
+                        ui.label("Automatic Setup:");
+                        let able_to_prefix = !wine_modal_data.selected_path.is_empty();
+                        let response = ui.add_enabled(able_to_prefix, egui::Button::new("Choose & Setup"));
+                        if response.clicked() {
+                            let path = DialogBuilder::file()
+                                .set_location(&std::env::home_dir().unwrap_or(Path::new(".").to_path_buf()))
+                                .open_single_dir()
+                                .show()
+                                .unwrap();
+                            if let Some(path) = path {
+                                let bin = get_winetricks_binary_path().unwrap();
+                                Command::new(&bin)
+                                    .env("WINE", wine_modal_data.selected_path)
+                                    .env("WINEPREFIX", &path)
+                                    .args(vec!["cmd", "d3dcompiler_47", "d3dx10", "d3dx11_43", "d3dx9", "dx8vb", "quartz", "vcrun2022", "dxvk"])
+                                    .spawn()
+                                    .expect("Failed to run winetricks");
+                                self.livedata.wine_modal_data.as_mut().unwrap().selected_prefix = path.to_string_lossy().to_string();
+                                self.gen_wine_modal_data(false);
+                            }
+                        }
+                        response.on_hover_text("Select a wineprefix and setup dependencies. This will run things in the background, be sure they are done before starting the game.")
+                    });
+                    ui.label("Selected prefix:");
+                    if ui.text_edit_singleline(&mut self.livedata.wine_modal_data.as_mut().unwrap().selected_prefix).changed() {
+                        self.gen_wine_modal_data(false);
+                    }
+                    ui.separator();
+                    ui.label("Command to run:");
+                    if ui.text_edit_singleline(&mut self.livedata.wine_modal_data.as_mut().unwrap().target_command).changed() {
+                        self.gen_wine_modal_data(false);
+                    };
+                    ui.separator();   
+                    ui.label("Final Command:");
+                    ui.add_enabled(false, egui::TextEdit::singleline(&mut wine_modal_data.final_command.clone()));
+                    ui.separator();
+                    let able_to_set = !(wine_modal_data.final_command == "Command incomplete");
+                    if ui.add_enabled(able_to_set, egui::Button::new("Set Command")).clicked() {
+                        self.settings["game_command"] = Value::String(wine_modal_data.final_command);
+                        save_settings(self.settings.clone());
+                        ui.close()
+                    }
                 });
                 if wine_modal.should_close() {
                     self.livedata.modal_open = ModalType::None;
+                    self.livedata.wine_modal_data = None;
                 }
             }
         }
-        //MARK: Modded EXEs Modal
-        //TODO Tools: Install latest modded EXEs.
-        if self.livedata.modal_open == ModalType::Modded {
-            let modded_exes_modal = Modal::new(Id::new("modded_exes_modal")).show(ui.ctx(), |ui| {
-                ui.style_mut().interaction.selectable_labels = false;
-                ui.heading("Install Modded EXEs");
-                ui.label("This feature is not yet implemented.");
-            });
-            if modded_exes_modal.should_close() {
-                self.livedata.modal_open = ModalType::None;
-            }
-        }
         //MARK: Import Modal
-        //TODO Tools: Import modpack
+        //TODO Modpack: Import modpack
+        //TODO Modpack: Import from MO2
+        //Modal
+        //MO2 Path
+        //Instance Path
+        //Start/Cancel
         if self.livedata.modal_open == ModalType::Import {
             let import_modal = Modal::new(Id::new("import_modal")).show(ui.ctx(), |ui| {
                 ui.style_mut().interaction.selectable_labels = false;
@@ -1169,27 +1286,11 @@ impl eframe::App for SuperPatchApp {
             }
         }
         //MARK: Export Modal
-        //TODO Tools: Export modpack
+        //TODO Modpack: Export modpack
         if self.livedata.modal_open == ModalType::Export {
             let import_modal = Modal::new(Id::new("export_modal")).show(ui.ctx(), |ui| {
                 ui.style_mut().interaction.selectable_labels = false;
                 ui.heading("Export Modpack");
-                ui.label("This feature is not yet implemented.");
-            });
-            if import_modal.should_close() {
-                self.livedata.modal_open = ModalType::None;
-            }
-        }
-        //MARK: MO2 Import Modal
-        //TODO Tools: Import from MO2
-        //Modal
-        //MO2 Path
-        //Instance Path
-        //Start/Cancel
-        if self.livedata.modal_open == ModalType::ImportMO2 {
-            let import_modal = Modal::new(Id::new("import_mo2_modal")).show(ui.ctx(), |ui| {
-                ui.style_mut().interaction.selectable_labels = false;
-                ui.heading("Import from MO2");
                 ui.label("This feature is not yet implemented.");
             });
             if import_modal.should_close() {
@@ -1520,7 +1621,7 @@ impl eframe::App for SuperPatchApp {
                                     let copy_archive = self.settings["copy_archive"].as_bool().unwrap_or(true);
                                     let delete_archive = self.settings["delete_archive"].as_bool().unwrap_or(true);
                                     let remove_list = if input_data.remove.is_some() {vec![input_data.remove.clone().unwrap()]} else {Vec::new()};
-                                    let root_list: Vec<(String, String)> = input_data.root_list.iter().filter(|a| a.1).map(|(a,b)| (a.to_string(), String::new())).collect();
+                                    let root_list: Vec<(String, String)> = input_data.root_list.iter().filter(|a| a.1).map(|(a,_)| (a.to_string(), String::new())).collect();
                                     self.livedata.install_modal_install_data = Some(InstallModalInstallData { root_list, remove_list, copy_archive, delete_archive, name: name.clone(), version, category: String::new(), specific_index: self.livedata.install_modal_requested_install_index, specific_index_target: self.livedata.install_modal_requested_install_index_target.clone(), website: String::new()})
                                 }
                             }
@@ -1608,12 +1709,21 @@ impl eframe::App for SuperPatchApp {
                             self.livedata.install_modal_requested_install_index_target = SpecificIndexTarget::Last;
                         }
                     }
+                    ui.separator();
                     if ui.button("Refresh").clicked() {
                         self.refresh_all()
                     }
                     if ui.button("Save VFS Changes").clicked() {
                         save_vfs_changes(Path::new(""));
                     }
+                    ui.separator();
+                    if ui.button("Export Modpack").clicked() {
+                        self.livedata.modal_open = ModalType::Export;
+                    }
+                    if ui.button("Import Modpack").clicked() {
+                        self.livedata.modal_open = ModalType::Import;
+                    }
+                    ui.separator();
                     if ui.button("Quit").clicked() {
                         ui.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
@@ -1624,24 +1734,6 @@ impl eframe::App for SuperPatchApp {
                         if ui.button("Setup Wine").clicked() {
                             self.livedata.modal_open = ModalType::Proton;
                         }
-                    }
-                    if ui.button("Install Modded EXEs").clicked() {
-                        self.livedata.modal_open = ModalType::Modded;
-                    }
-                    if ui.button("Setup Modal").clicked() {
-                        self.livedata.modal_open = ModalType::Setup;
-                    };
-                    if ui.button("Install Game").clicked() {
-                        self.livedata.modal_open = ModalType::Game;
-                    }
-                    if ui.button("Export Modpack").clicked() {
-                        self.livedata.modal_open = ModalType::Export;
-                    }
-                    if ui.button("Import from MO2").clicked() {
-                        self.livedata.modal_open = ModalType::ImportMO2;
-                    }
-                    if ui.button("Import Modpack").clicked() {
-                        self.livedata.modal_open = ModalType::Import;
                     }
                 });
             });
@@ -1690,6 +1782,15 @@ impl eframe::App for SuperPatchApp {
                     save_settings(self.settings.clone());
                     self.clear_settings_edit();
                 }
+                if ui.button("Delete shaders_cache").clicked() {
+                    let path = Path::new(".saved/appdata/shaders_cache");
+                    if path.exists() {
+                        match fs::remove_dir_all(path) {
+                            Ok(_) => {*self.status.lock().unwrap() = format!("Deleted shaders_cache successfully.")},
+                            Err(e) => {*self.status.lock().unwrap() = format!("Failed to delete shaders_cache. Error: {}",e)}
+                        }
+                    }
+                }
             });
         });
         //MARK: Bottom Panel
@@ -1705,6 +1806,7 @@ impl eframe::App for SuperPatchApp {
                     Tab::Files => {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             //TODO General: Search bar for Files Tab
+                            //TODO Patch: Revise Sorting for patch update
                             let sort_text = match self.vfssort.sort_type {
                                 VFSSortType::All => "Show All",
                                 VFSSortType::Conflicts => "Show Conflicts",
@@ -1749,10 +1851,9 @@ impl eframe::App for SuperPatchApp {
             match self.selected_tab {
                 //MARK: Configuration Page
                 Tab::Organize => {
-                    //FIXME General: Fix table sizing issues
+                    //TODO General: Fix table sizing issues
                     //Underfill: Calculate new size upon window resizing relative to previous size.
                     //Overflow: Shrink other columns to fit in area until too small, then stop
-                    let mut request_update = false;
                     let original_widths = self.settings["organize_widths"].as_array().cloned().unwrap_or_else(|| vec![Value::from(50.0), Value::from(200.0), Value::from(100.0), Value::from(100.0), Value::from(100.0)]);
                     TableBuilder::new(ui)
                     .sense(egui::Sense::click_and_drag())
@@ -2050,9 +2151,6 @@ impl eframe::App for SuperPatchApp {
                             });
                         });
                     });
-                    if request_update {
-                        self.update_all();
-                    }
                     //MARK: Drag and Drop
                     if egui::DragAndDrop::has_payload_of_type::<i64>(ui.ctx()) {
                         let payload = *egui::DragAndDrop::payload::<i64>(ui.ctx()).unwrap();
@@ -2067,7 +2165,7 @@ impl eframe::App for SuperPatchApp {
                         }
                     }
                     if egui::DragAndDrop::has_any_payload(ui.ctx()) {
-                        //TODO General: Scroll when touching edges of screen & dragging.
+                        //FIXME General: Scroll when touching edges of screen & dragging.
                     }
                 }
                 //MARK: Files Page
@@ -2077,7 +2175,7 @@ impl eframe::App for SuperPatchApp {
                         self.vfssort_list_refresh_requested = false;
                     }
                     let original_widths = self.settings["files_widths"].as_array().cloned().unwrap_or_else(|| vec![Value::from(200.0), Value::from(100.0), Value::from(100.0)]);
-                    //FIXME General: Fix table sizing issues (See above.)
+                    //TODO General: Fix table sizing issues (See above.)
                     TableBuilder::new(ui)
                     .sense(egui::Sense::click())
                     .striped(true)
@@ -2160,6 +2258,20 @@ impl eframe::App for SuperPatchApp {
 }
 //MARK: Main
 fn main() {
+    #[cfg(target_os = "windows")] {
+        let temp_dir = std::env::temp_dir();
+        let src = temp_dir.join("symlink_test_src.txt");
+        let dst = temp_dir.join("symlink_test_dst.lnk");
+        let result = std::os::windows::fs::symlink_file(src, dst);
+        let _ = fs::remove_file(&src);
+        if dst.exists() || fs::symlink_metadata(&dst).is_ok() {
+            let _ = fs::remove_file(&dst);
+        }
+        match result {
+        Ok(_) => {},
+        Err(e) => {windows_elevate::elevate().expect("Failed to elevate to enable symlinks.")}
+        }
+    }
     if !Path::exists(Path::new("configs")) {
         fs::create_dir("configs").expect("Failed to create configs directory");
     }
@@ -2385,7 +2497,7 @@ fn gen_vfs_data(
 }
 
 fn vfs_scan(path: &str, origin_path: &str, mut vfsdata: VFSTree) -> VFSNode {
-    //TODO Patch: DLTX Patch support
+    //TODO Patch: DLTX support
     if let Ok(entries) = fs::read_dir(path) {
         for entry in entries.flatten() {
             let entry_path = entry.path();
@@ -2468,11 +2580,13 @@ fn gen_vfs_sort_data_recursive(
             let mut conflicts = file.paths.len().try_into().unwrap_or(0);
             if conflicts == 1 {
                 conflicts = 0;
+            } else {
+                conflicts = conflicts - 1;
             }
             let dltx_patches = file.dltx_patches.len().try_into().unwrap_or(0);
             //TODO Patch: Check patchdata
-            let dltx_patches_active = dltx_patches;
-            let conflicts_active = conflicts;
+            let internal_conflicts = 0;
+            let patchstatus = PatchStatus::None;
             vfssortlist.push(VFSSortListEntry {
                 path: key.clone(),
                 name,
@@ -2480,9 +2594,9 @@ fn gen_vfs_sort_data_recursive(
                 extended: false,
                 file_type,
                 conflicts,
-                conflicts_active,
                 dltx_patches,
-                dltx_patches_active,
+                internal_conflicts,
+                patchstatus
             });
         } else {
             let extended = vfssort.expanded.contains(&key);
@@ -2493,9 +2607,9 @@ fn gen_vfs_sort_data_recursive(
                 extended,
                 file_type: "folder".into(),
                 conflicts: 0,
-                conflicts_active: 0,
                 dltx_patches: 0,
-                dltx_patches_active: 0,
+                internal_conflicts: 0,
+                patchstatus: PatchStatus::None
             });
             if let VFSNode::Dir(children) = value {
                 vfssortlist.extend(gen_vfs_sort_data_recursive(
@@ -2561,7 +2675,6 @@ fn vfs_sort_data_prune_folders(vfssortlist: &mut Vec<VFSSortListEntry>, vfssort:
 }
 //MARK: VFS Realization
 fn realize_vfs_data(vfsdata: VFSTree, patchdata: Value) -> PathBuf {
-    //TODO Patch: Realize patchdata
 
     if fs::metadata(".vfs").is_ok() {
         fs::remove_dir_all(".vfs").expect("Failed to remove existing .vfs directory");
@@ -2994,7 +3107,7 @@ fn pick_mod_file() -> Option<PathBuf> {
         .set_location(&std::env::home_dir().unwrap_or(Path::new(".").to_path_buf()))
         .add_filter("All supported files", unarc_rs::unified::supported_extensions())
         .add_filter("All files (Bad idea)", ["*"])
-        .set_title("Select Mod Folder")
+        .set_title("Select Mod Archive")
         .open_single_file()
         .show()
         .unwrap()
@@ -3095,6 +3208,29 @@ fn get_7z_binary_path() -> std::io::Result<PathBuf> {
             perms.set_mode(0o755);
             fs::set_permissions(&bin_path, perms)?;
         }
+    }
+    Ok(bin_path)
+}
+
+//SLOP
+#[cfg(unix)]
+fn get_winetricks_binary_path() -> std::io::Result<PathBuf> {
+    // Use a persistent cache dir so we only write once
+    let cache_dir = std::env::temp_dir().join("superpatch");
+    fs::create_dir_all(&cache_dir)?;
+
+    let bin_name = "winetricks";
+    let bin_path = cache_dir.join(bin_name);
+
+    // Only write if not already present (simple check; add hash if you want updates)
+    if !bin_path.exists() {
+        let mut file = File::create(&bin_path)?;
+        file.write_all(WINETRICKS_BYTES)?;
+
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&bin_path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&bin_path, perms)?;
     }
     Ok(bin_path)
 }
